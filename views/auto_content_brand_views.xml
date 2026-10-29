@@ -22,8 +22,8 @@
             <form>
                 <header>
                     <button name="action_test" type="object" string="Probar con la foto del paquete" class="btn-primary"
-                            invisible="not test_photo_path or not llm_provider_id"
-                            confirm="Se llama a la IA (tiene costo) y se arma una pieza de prueba. ¿Seguimos?"/>
+                            invisible="not test_photo_path or (ai_mode == 'provider' and not llm_provider_id)"
+                            confirm="Se arma una pieza de prueba con la IA de la marca. ¿Seguimos?"/>
                 </header>
                 <sheet>
                     <div class="oe_button_box" name="button_box">
@@ -51,10 +51,12 @@
                             <field name="test_photo_path" invisible="1"/>
                         </group>
                         <group string="IA">
-                            <field name="llm_provider_id"/>
-                            <field name="llm_model"/>
-                            <field name="llm_temperature"/>
-                            <field name="llm_max_tokens"/>
+                            <field name="ai_mode" widget="radio"/>
+                            <field name="claude_model" invisible="ai_mode != 'claude_code'"/>
+                            <field name="llm_provider_id" invisible="ai_mode != 'provider'"/>
+                            <field name="llm_model" invisible="ai_mode != 'provider'"/>
+                            <field name="llm_temperature" invisible="ai_mode != 'provider'"/>
+                            <field name="llm_max_tokens" invisible="ai_mode != 'provider'"/>
                         </group>
                     </group>
                     <notebook>

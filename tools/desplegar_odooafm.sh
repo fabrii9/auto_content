@@ -21,13 +21,15 @@ remoto() { ssh -o IdentitiesOnly=yes -o LogLevel=ERROR ${SSH_OPTS:-} -i "$KEY" "
 
 modulo() {
   echo "→ Subiendo auto_content a $DIR/addons_custom"
+  # Lo temporal y la copia anterior van fuera de addons_custom: Odoo rechaza
+  # cualquier carpeta con nombre de módulo inválido dentro del addons_path.
   COPYFILE_DISABLE=1 tar --no-xattrs -C "$(dirname "$MODULO")" --exclude='__pycache__' --exclude='.DS_Store' \
-    --exclude='*.zip' -czf - auto_content \
-    | remoto "set -e; cd $DIR/addons_custom; rm -rf auto_content.nuevo; mkdir auto_content.nuevo; \
-              tar -xzf - -C auto_content.nuevo; rm -rf auto_content.anterior; \
-              if [ -d auto_content ]; then mv auto_content auto_content.anterior; fi; \
-              mv auto_content.nuevo/auto_content auto_content; rmdir auto_content.nuevo; \
-              chown -R root:root auto_content; echo \"  \$(find auto_content -type f | wc -l) archivos\""
+    --exclude='.git' --exclude='*.zip' --exclude='*.env' -czf - auto_content \
+    | remoto "set -e; B=$DIR/backups/auto_content; mkdir -p \$B; rm -rf \$B/nuevo \$B/anterior; mkdir \$B/nuevo; \
+              tar -xzf - -C \$B/nuevo; chown -R root:root \$B/nuevo; \
+              if [ -d $DIR/addons_custom/auto_content ]; then mv $DIR/addons_custom/auto_content \$B/anterior; fi; \
+              mv \$B/nuevo/auto_content $DIR/addons_custom/auto_content; rmdir \$B/nuevo; \
+              echo \"  \$(find $DIR/addons_custom/auto_content -type f | wc -l) archivos (copia anterior en \$B/anterior)\""
   echo "  Si el módulo ya estaba instalado: Aplicaciones → Contenido automatizado → Actualizar."
 }
 

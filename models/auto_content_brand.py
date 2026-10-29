@@ -51,6 +51,16 @@ class AutoContentBrand(models.Model):
     )
     place_ids = fields.One2many('auto.content.place', 'brand_id', string='Lugares')
 
+    ai_mode = fields.Selection(
+        [('provider', 'Proveedor por API (LLM Connector)'), ('claude_code', 'Claude Code (worker del operador)')],
+        string='Modo de IA', required=True, default='provider', tracking=True,
+        help='Con Claude Code, las solicitudes esperan a que el worker (tools/claude_worker.py), '
+             'corriendo en una PC con Claude Code logueado, las tome y devuelva el plan.',
+    )
+    claude_model = fields.Char(
+        string='Modelo de Claude Code', default='sonnet',
+        help='Alias o nombre completo que recibe claude --model (sonnet, opus, haiku...).',
+    )
     llm_provider_id = fields.Many2one(
         'llm.provider', string='Proveedor de IA', ondelete='restrict',
         help='Tiene que ser OpenAI, Anthropic o compatible con OpenAI, y el modelo tiene que ver imágenes.',
@@ -156,17 +166,22 @@ class AutoContentBrand(models.Model):
     # ------------------------------------------------------------------
     # IA
     # ------------------------------------------------------------------
+    def _prompts(self, texts, media, previous_plan=None, instruction=None):
+        """``(system, user)`` para la IA; los mismos en los dos modos."""
+        self.ensure_one()
+        system_text = planner.build_system_prompt(
+            self.name, self._designs(), self._places(), self.instructions, self.knowledge, self.extra_instructions,
+        )
+        return system_text, planner.build_user_prompt(texts, media, previous_plan, instruction)
+
     def _ai_plan(self, texts, media, images, previous_plan=None, instruction=None):
-        """Pide el plan a la IA. ``images`` son JPEG en el orden de ``media``."""
+        """Pide el plan al proveedor por API. ``images`` son JPEG en el orden de ``media``."""
         self.ensure_one()
         provider = self.llm_provider_id.sudo()
         if not provider:
             raise UserError(_('Configurá el proveedor de IA de la marca %s.') % self.name)
         designs = self._designs()
-        system_text = planner.build_system_prompt(
-            self.name, designs, self._places(), self.instructions, self.knowledge, self.extra_instructions,
-        )
-        user_text = planner.build_user_prompt(texts, media, previous_plan, instruction)
+        system_text, user_text = self._prompts(texts, media, previous_plan, instruction)
         messages = planner.build_messages(provider.provider_type, system_text, user_text, images)
         extra = {}
         if provider.provider_type in ('openai', 'custom', 'kimi', 'groq'):

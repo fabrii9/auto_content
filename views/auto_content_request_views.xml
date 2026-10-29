@@ -121,7 +121,7 @@
                 <field name="name"/>
                 <field name="brand_id"/>
                 <field name="operator_id"/>
-                <filter name="pending" string="Pendientes" domain="[('state', 'in', ('review', 'feedback', 'brand', 'error'))]"/>
+                <filter name="pending" string="Pendientes" domain="[('state', 'in', ('waiting_ai', 'review', 'feedback', 'brand', 'error'))]"/>
                 <filter name="approved" string="Aprobadas" domain="[('state', '=', 'approved')]"/>
                 <separator/>
                 <filter name="group_brand" string="Marca" context="{'group_by': 'brand_id'}"/>

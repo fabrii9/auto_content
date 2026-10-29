@@ -9,7 +9,7 @@ Es un módulo aparte y para varios clientes: depende de `mail`, `whatsapp` y `ll
 1. **Solo escucha a los operadores.** Los mensajes de los números cargados en *Configuración → Operadores* los toma el módulo. A esos chats les apaga el agente de ventas de `whatsapp_ai_agents` (si está instalado). El resto de las conversaciones de WhatsApp siguen igual.
 2. **Junta el material.** Fotos, videos y textos van a una solicitud abierta. Cuando pasan *Espera para juntar* segundos (90 por defecto) sin mensajes nuevos, la solicitud pasa a la cola. Lo reenviado cuenta siempre como material, nunca como una orden.
 3. **Arma la pieza.** Una tarea automática que corre cada minuto:
-   - le manda a la IA las fotos (o un cuadro de cada video) y los textos, junto con las instrucciones, el conocimiento y los lugares de la marca;
+   - le manda a la IA (por API, o al worker de Claude Code según la marca) las fotos (o un cuadro de cada video) y los textos, junto con las instrucciones, el conocimiento y los lugares de la marca;
    - la IA devuelve un JSON con el diseño, el archivo elegido, los textos y las alertas;
    - Chrome headless rellena la plantilla del paquete;
    - si el archivo es un video, ffmpeg le superpone la plantilla y lo recorta a 60 s.
@@ -25,6 +25,24 @@ Es un módulo aparte y para varios clientes: depende de `mail`, `whatsapp` y `ll
 - `ayuda`: muestra la ayuda.
 - `reintentar`: vuelve a intentar la última solicitud que falló.
 - `ok` / `descartar`: equivalen a los botones.
+
+## Modo de IA: Claude Code (sin API)
+
+Cada marca elige su modo de IA:
+
+- **Proveedor por API:** Odoo llama a LLM Connector (OpenAI o Anthropic). Es automático y se paga por uso.
+- **Claude Code:** las solicitudes quedan en estado *Esperando IA*. `tools/claude_worker.py` las toma y resuelve la IA con Claude Code. El worker corre en una PC que queda siempre prendida, con Claude Code instalado y logueado con la cuenta del operador. Odoo valida la respuesta con las mismas reglas, arma la pieza y la manda.
+
+Cómo se pone en marcha el worker:
+
+1. En la PC, instalá Claude Code, ejecutá `claude` una vez para loguearte y Python 3.
+2. En Odoo, creá una **API key** para un usuario del grupo *Contenido automatizado / Administrador* (Preferencias → Seguridad de la cuenta).
+3. Creá `tools/claude_worker.env` con `AC_ODOO_URL`, `AC_ODOO_DB`, `AC_ODOO_USER` y `AC_ODOO_KEY`; el resto de las opciones están en el encabezado del script.
+4. Probá con `python3 claude_worker.py --once`. Después dejalo corriendo como servicio: `launchd` en macOS, `systemd` en Linux o el Programador de tareas en Windows.
+
+**En Windows** hacé todo con `tools/instalar_worker_windows.ps1`. Pide los datos de Odoo, hace una prueba y crea una tarea programada que arranca al iniciar sesión y se reinicia si el worker se cae. Instalalo con el mismo usuario de Windows que está logueado en Claude Code. Si querés que vuelva a arrancar solo después de un corte de luz, activá el inicio de sesión automático.
+
+Claude Code solo corre cuando hay trabajo, y lo hace con `--tools Read`: lo único que puede hacer es leer las imágenes de la solicitud. Usá siempre el Claude Code oficial, sin modificar y con tu cuenta, para tu trabajo y con un volumen razonable. No extraigas el token para usarlo desde otros programas.
 
 ## Requisitos del servidor
 

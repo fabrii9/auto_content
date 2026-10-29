@@ -1,6 +1,6 @@
 {
     'name': 'Contenido automatizado',
-    'version': '19.0.1.0.0',
+    'version': '19.0.1.1.0',
     'category': 'Marketing',
     'summary': 'Convierte fotos y videos recibidos por WhatsApp en piezas de marca, con aprobación por WhatsApp',
     'description': """

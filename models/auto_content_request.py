@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 
+import base64
 import json
 import logging
 import mimetypes
@@ -12,7 +13,7 @@ from pathlib import Path
 from markupsafe import Markup
 
 from odoo import _, api, fields, models
-from odoo.exceptions import UserError
+from odoo.exceptions import AccessError, UserError
 from odoo.addons.whatsapp.tools.whatsapp_api import WhatsAppApi
 
 from ..services import planner, renderer
@@ -26,6 +27,7 @@ REQUEST_STATES = [
     ('collecting', 'Recibiendo'),
     ('brand', 'Esperando marca'),
     ('queued', 'En cola'),
+    ('waiting_ai', 'Esperando IA'),
     ('processing', 'Armando'),
     ('review', 'Para revisar'),
     ('feedback', 'Esperando cambios'),
@@ -187,14 +189,14 @@ class AutoContentRequest(models.Model):
                 _logger.exception('auto_content: no pude mandar los botones de marca.')
         operator._notify(_('¿De qué marca es %s? Escribí su código.\n\n%s') % (self.name, operator._help_text()))
 
-    def _run(self):
+    def _run(self, answer=None, worker=None):
         """Arma una versión y la manda. Los errores quedan en la solicitud."""
         self.ensure_one()
         self.write({'state': 'processing', 'error_message': False})
         self.env['ir.cron']._commit_progress()
         try:
             with self.env.cr.savepoint():
-                self._build_version()
+                self._build_version(answer=answer, worker=worker)
         except Exception as exc:
             _logger.exception('auto_content: falló %s.', self.name)
             message = str(exc) or exc.__class__.__name__
@@ -205,43 +207,69 @@ class AutoContentRequest(models.Model):
                     'No pude armar %(name)s: %(error)s\n\nEscribí "reintentar" para probar de nuevo.'
                 ) % {'name': self.name, 'error': message[:500]})
 
-    def _build_version(self):
+    def _prepare_media(self, workdir):
+        """Escribe el material en ``workdir``.
+
+        Devuelve ``(texts, media, images)``: ``images`` son JPEG para la IA
+        (un cuadro por video), en el orden de ``media`` y como máximo
+        ``MAX_MEDIA_FOR_AI``.
+        """
+        texts, media = self._material()
+        ffmpeg = None
+        images = []
+        for item in media:
+            attachment = item['attachment']
+            suffix = mimetypes.guess_extension(attachment.mimetype or '') or ('.mp4' if item['kind'] == 'video' else '.jpg')
+            item['path'] = workdir / ('media-%d%s' % (item['index'], suffix))
+            item['path'].write_bytes(attachment.raw)
+            if len(images) >= MAX_MEDIA_FOR_AI:
+                continue
+            if item['kind'] == 'video':
+                ffmpeg = ffmpeg or renderer.find_ffmpeg(self._param('ffmpeg_path'))
+                frame = renderer.video_frame(item['path'], workdir / ('frame-%d.jpg' % item['index']), ffmpeg)
+                images.append(planner.to_jpeg(frame.read_bytes()))
+            else:
+                images.append(planner.to_jpeg(attachment.raw))
+        return texts, media, images
+
+    def _ai_media(self, media):
+        return [{'index': m['index'], 'kind': m['kind']} for m in media][:MAX_MEDIA_FOR_AI]
+
+    def _previous_plan(self):
+        previous = self.current_version_id
+        return json.loads(previous.plan_json) if previous and previous.plan_json else None
+
+    def _build_version(self, answer=None, worker=None):
+        """Arma una versión.
+
+        Sin ``answer`` le pide el plan al proveedor de la marca, o, en modo
+        Claude Code, deja la solicitud esperando al worker. Con ``answer`` (la
+        respuesta del worker) valida ese plan y arma la pieza.
+        """
         self.ensure_one()
         brand = self.brand_id
         if not brand:
             raise UserError(_('La solicitud no tiene marca.'))
-        texts, media = self._material()
         previous = self.current_version_id
         instruction = self.pending_instruction
-        if self.operator_id and not previous:
+        if self.operator_id and not previous and answer is None:
             self.operator_id._notify(_('Armando %(name)s para %(brand)s con %(count)s archivo(s)…') % {
-                'name': self.name, 'brand': brand.name, 'count': len(media)})
+                'name': self.name, 'brand': brand.name, 'count': self.media_count})
+        if answer is None and brand.ai_mode == 'claude_code':
+            self.state = 'waiting_ai'
+            return self.env['auto.content.version']
 
         started = time.monotonic()
         workdir = Path(tempfile.mkdtemp(prefix='auto-content-'))
         try:
-            ffmpeg = None
-            images = []
-            for item in media:
-                attachment = item['attachment']
-                suffix = mimetypes.guess_extension(attachment.mimetype or '') or ('.mp4' if item['kind'] == 'video' else '.jpg')
-                item['path'] = workdir / ('media-%d%s' % (item['index'], suffix))
-                item['path'].write_bytes(attachment.raw)
-                if len(images) >= MAX_MEDIA_FOR_AI:
-                    continue
-                if item['kind'] == 'video':
-                    ffmpeg = ffmpeg or renderer.find_ffmpeg(self._param('ffmpeg_path'))
-                    frame = renderer.video_frame(item['path'], workdir / ('frame-%d.jpg' % item['index']), ffmpeg)
-                    images.append(planner.to_jpeg(frame.read_bytes()))
-                else:
-                    images.append(planner.to_jpeg(attachment.raw))
-            ai_media = [{'index': m['index'], 'kind': m['kind']} for m in media][:len(images)]
-
-            plan = brand._ai_plan(
-                texts, ai_media, images,
-                previous_plan=json.loads(previous.plan_json) if previous and previous.plan_json else None,
-                instruction=instruction,
-            )
+            texts, media, images = self._prepare_media(workdir)
+            ai_media = self._ai_media(media)[:len(images)]
+            if answer is None:
+                plan = brand._ai_plan(texts, ai_media, images, self._previous_plan(), instruction)
+                model = brand.llm_model
+            else:
+                plan = planner.parse_plan(answer, brand._designs(), ai_media)
+                model = 'Claude Code · %s' % (worker or brand.claude_model or '')
             output, kind = self._render(plan, media, workdir)
         finally:
             shutil.rmtree(workdir, ignore_errors=True)
@@ -259,7 +287,7 @@ class AutoContentRequest(models.Model):
             'sticker': plan['sticker'] or False,
             'caption': plan['texto_publicacion'] or False,
             'output_kind': kind,
-            'llm_model': brand.llm_model,
+            'llm_model': model,
             'duration': time.monotonic() - started,
         })
         extension = '.mp4' if kind == 'video' else '.png'
@@ -305,6 +333,74 @@ class AutoContentRequest(models.Model):
         return self.env['ir.config_parameter'].sudo().get_param('auto_content.%s' % key) or None
 
     # ------------------------------------------------------------------
+    # Worker de Claude Code (tools/claude_worker.py, por XML-RPC)
+    # ------------------------------------------------------------------
+    def _check_worker(self):
+        if not self.env.user.has_group('auto_content.grupo_auto_content_admin'):
+            raise AccessError(_('El worker tiene que usar un usuario administrador de Contenido automatizado.'))
+
+    @api.model
+    def worker_claim_jobs(self, limit=1):
+        """Toma solicitudes que esperan IA y devuelve lo necesario para resolverlas.
+
+        Una solicitud tomada pasa a "Armando". Si el worker no responde en
+        ``STALE_PROCESSING``, la cola la vuelve a ofrecer.
+        """
+        self._check_worker()
+        jobs = []
+        for request in self.search([('state', '=', 'waiting_ai')], order='id', limit=max(1, min(limit, 5))):
+            brand = request.brand_id
+            workdir = Path(tempfile.mkdtemp(prefix='auto-content-job-'))
+            try:
+                texts, media, images = request._prepare_media(workdir)
+            finally:
+                shutil.rmtree(workdir, ignore_errors=True)
+            system_text, user_text = brand._prompts(
+                texts, request._ai_media(media)[:len(images)], request._previous_plan(), request.pending_instruction,
+            )
+            request.write({'state': 'processing', 'error_message': False})
+            jobs.append({
+                'id': request.id,
+                'name': request.name,
+                'brand': brand.name,
+                'model': brand.claude_model or 'sonnet',
+                'system': system_text,
+                'user': user_text,
+                'images': [base64.b64encode(image).decode() for image in images],
+            })
+        return jobs
+
+    @api.model
+    def worker_submit(self, request_id, answer, worker=None):
+        """Recibe la respuesta del worker. Si el JSON no sirve, devuelve el error
+        para que el worker lo corrija; si sirve, arma la pieza y la manda."""
+        self._check_worker()
+        request = self.browse(request_id).exists()
+        if not request or request.state != 'processing':
+            return {'ok': False, 'retry': False, 'error': 'La solicitud ya no está tomada por el worker.'}
+        _texts, media = request._material()
+        try:
+            planner.parse_plan(answer, request.brand_id._designs(), request._ai_media(media))
+        except planner.PlanError as exc:
+            return {'ok': False, 'retry': True, 'error': str(exc)}
+        request._run(answer=answer, worker=worker)
+        return {'ok': request.state == 'review', 'retry': False, 'state': request.state,
+                'error': request.error_message or False}
+
+    @api.model
+    def worker_fail(self, request_id, message):
+        self._check_worker()
+        request = self.browse(request_id).exists()
+        if request and request.state == 'processing':
+            request.write({'state': 'error', 'error_message': message})
+            request.message_post(body=_('Error del worker: %s') % message)
+            if request.operator_id:
+                request.operator_id._notify(_(
+                    'No pude armar %(name)s: %(error)s\n\nEscribí "reintentar" para probar de nuevo.'
+                ) % {'name': request.name, 'error': message[:500]})
+        return True
+
+    # ------------------------------------------------------------------
     # Decisiones del operador
     # ------------------------------------------------------------------
     def _request_change(self, instruction):
@@ -323,6 +419,7 @@ class AutoContentRequest(models.Model):
     def action_queue(self):
         for request in self.filtered(lambda r: r.state in ('error', 'discarded', 'brand') and r.brand_id):
             request.write({'state': 'queued', 'error_message': False})
+        return True
 
     def action_run_now(self):
         self.ensure_one()
@@ -333,11 +430,13 @@ class AutoContentRequest(models.Model):
 
     def action_discard(self):
         self._discard()
+        return True
 
     def action_approve(self):
         for request in self:
             if request.current_version_id and request.state in ('review', 'feedback'):
                 request.current_version_id._approve()
+        return True
 
 
 class AutoContentVersion(models.Model):

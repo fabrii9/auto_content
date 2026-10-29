@@ -30,6 +30,21 @@ class RenderError(RuntimeError):
     """No se pudo generar la pieza."""
 
 
+def _lift_memory_limit():
+    """Los workers de Odoo limitan la memoria virtual (limit_memory_hard) y los
+    procesos hijos lo heredan; Chromium reserva mucho más al arrancar y muere.
+    Se levanta solo en el proceso hijo, hasta el límite duro del sistema."""
+    try:
+        import resource
+        _soft, hard = resource.getrlimit(resource.RLIMIT_AS)
+        resource.setrlimit(resource.RLIMIT_AS, (hard, hard))
+    except (ImportError, ValueError, OSError):
+        pass
+
+
+_CHILD = {'preexec_fn': _lift_memory_limit} if os.name == 'posix' else {}
+
+
 def find_chrome(override=None):
     candidates = (override,) if override else CHROME_CANDIDATES
     for pattern in candidates:
@@ -79,7 +94,7 @@ def render_html(template_path, data, out_path, width, height, chrome, transparen
     try:
         result = subprocess.run(
             command, capture_output=True, timeout=timeout,
-            env={**os.environ, 'HOME': profile},
+            env={**os.environ, 'HOME': profile}, **_CHILD,
         )
     except subprocess.TimeoutExpired as exc:
         raise RenderError('Chromium tardó más de %s s.' % timeout) from exc
@@ -87,13 +102,14 @@ def render_html(template_path, data, out_path, width, height, chrome, transparen
         page.unlink(missing_ok=True)
         shutil.rmtree(profile, ignore_errors=True)
     if result.returncode != 0 or not Path(out_path).exists():
-        raise RenderError('Chromium falló: %s' % result.stderr.decode('utf-8', 'replace')[-800:])
+        raise RenderError('Chromium falló (código %s): %s' % (
+            result.returncode, result.stderr.decode('utf-8', 'replace')[-800:] or 'sin mensaje'))
     return Path(out_path)
 
 
 def _run_ffmpeg(command, timeout):
     try:
-        result = subprocess.run(command, capture_output=True, timeout=timeout)
+        result = subprocess.run(command, capture_output=True, timeout=timeout, **_CHILD)
     except subprocess.TimeoutExpired as exc:
         raise RenderError('ffmpeg tardó más de %s s.' % timeout) from exc
     if result.returncode != 0:
