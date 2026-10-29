@@ -1,0 +1,13 @@
+id,name,model_id:id,group_id:id,perm_read,perm_write,perm_create,perm_unlink
+acceso_request_usuario,auto.content.request.usuario,model_auto_content_request,grupo_auto_content_usuario,1,1,1,0
+acceso_request_admin,auto.content.request.admin,model_auto_content_request,grupo_auto_content_admin,1,1,1,1
+acceso_version_usuario,auto.content.version.usuario,model_auto_content_version,grupo_auto_content_usuario,1,1,0,0
+acceso_version_admin,auto.content.version.admin,model_auto_content_version,grupo_auto_content_admin,1,1,1,1
+acceso_message_usuario,auto.content.message.usuario,model_auto_content_message,grupo_auto_content_usuario,1,0,0,0
+acceso_message_admin,auto.content.message.admin,model_auto_content_message,grupo_auto_content_admin,1,1,1,1
+acceso_brand_usuario,auto.content.brand.usuario,model_auto_content_brand,grupo_auto_content_usuario,1,0,0,0
+acceso_brand_admin,auto.content.brand.admin,model_auto_content_brand,grupo_auto_content_admin,1,1,1,1
+acceso_place_usuario,auto.content.place.usuario,model_auto_content_place,grupo_auto_content_usuario,1,0,0,0
+acceso_place_admin,auto.content.place.admin,model_auto_content_place,grupo_auto_content_admin,1,1,1,1
+acceso_operator_usuario,auto.content.operator.usuario,model_auto_content_operator,grupo_auto_content_usuario,1,0,0,0
+acceso_operator_admin,auto.content.operator.admin,model_auto_content_operator,grupo_auto_content_admin,1,1,1,1

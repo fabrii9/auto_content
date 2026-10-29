@@ -1,0 +1,184 @@
+<?xml version="1.0" encoding="utf-8"?>
+<odoo>
+    <record id="vista_auto_content_request_list" model="ir.ui.view">
+        <field name="name">auto.content.request.list</field>
+        <field name="model">auto.content.request</field>
+        <field name="arch" type="xml">
+            <list create="false" decoration-success="state == 'approved'" decoration-danger="state == 'error'"
+                  decoration-muted="state == 'discarded'" decoration-info="state in ('review', 'feedback')">
+                <field name="name"/>
+                <field name="brand_id"/>
+                <field name="operator_id"/>
+                <field name="media_count"/>
+                <field name="current_version_id" string="Versión"/>
+                <field name="create_date" string="Recibida"/>
+                <field name="state" widget="badge"/>
+            </list>
+        </field>
+    </record>
+
+    <record id="vista_auto_content_request_kanban" model="ir.ui.view">
+        <field name="name">auto.content.request.kanban</field>
+        <field name="model">auto.content.request</field>
+        <field name="arch" type="xml">
+            <kanban default_group_by="state" quick_create="false" create="false">
+                <field name="name"/>
+                <field name="brand_id"/>
+                <field name="preview"/>
+                <field name="media_count"/>
+                <field name="state"/>
+                <templates>
+                    <t t-name="card">
+                        <field t-if="record.preview.raw_value" name="preview" widget="image" class="w-100 mb-2"/>
+                        <div class="d-flex justify-content-between align-items-start">
+                            <strong><field name="name"/></strong>
+                            <field name="state" widget="badge"/>
+                        </div>
+                        <div class="text-muted mt-1"><field name="brand_id"/></div>
+                        <footer class="mt-2">
+                            <span><field name="media_count"/> archivo(s)</span>
+                        </footer>
+                    </t>
+                </templates>
+            </kanban>
+        </field>
+    </record>
+
+    <record id="vista_auto_content_request_form" model="ir.ui.view">
+        <field name="name">auto.content.request.form</field>
+        <field name="model">auto.content.request</field>
+        <field name="arch" type="xml">
+            <form create="false">
+                <header>
+                    <button name="action_approve" type="object" string="Aprobar" class="btn-primary"
+                            invisible="state not in ('review', 'feedback')"/>
+                    <button name="action_run_now" type="object" string="Armar ahora"
+                            invisible="state not in ('queued', 'error')"/>
+                    <button name="action_queue" type="object" string="Volver a la cola"
+                            invisible="state not in ('error', 'discarded', 'brand')"/>
+                    <button name="action_discard" type="object" string="Descartar"
+                            invisible="state in ('discarded', 'approved')"/>
+                    <field name="state" widget="statusbar" statusbar_visible="collecting,queued,review,approved"/>
+                </header>
+                <sheet>
+                    <field name="preview" widget="image" class="oe_avatar" options="{'size': [270, 480]}"
+                           invisible="not preview"/>
+                    <div class="oe_title">
+                        <h1><field name="name"/></h1>
+                    </div>
+                    <group>
+                        <group>
+                            <field name="brand_id" readonly="state not in ('collecting', 'brand', 'error')"/>
+                            <field name="operator_id"/>
+                            <field name="company_id" groups="base.group_multi_company"/>
+                        </group>
+                        <group>
+                            <field name="process_after" invisible="state != 'collecting'"/>
+                            <field name="current_version_id"/>
+                            <field name="pending_instruction" invisible="not pending_instruction"/>
+                        </group>
+                    </group>
+                    <div class="alert alert-danger" role="alert" invisible="not error_message">
+                        <field name="error_message"/>
+                    </div>
+                    <notebook>
+                        <page string="Versiones" name="versions">
+                            <field name="version_ids" readonly="1">
+                                <list>
+                                    <field name="sequence"/>
+                                    <field name="design"/>
+                                    <field name="place"/>
+                                    <field name="instruction"/>
+                                    <field name="alerts"/>
+                                    <field name="state" widget="badge"/>
+                                    <button name="action_download" type="object" icon="fa-download" title="Descargar"/>
+                                </list>
+                            </field>
+                        </page>
+                        <page string="Material recibido" name="inbound">
+                            <field name="inbound_ids" readonly="1">
+                                <list>
+                                    <field name="create_date" string="Recibido"/>
+                                    <field name="kind"/>
+                                    <field name="body"/>
+                                    <field name="attachment_id"/>
+                                    <field name="is_material"/>
+                                </list>
+                            </field>
+                        </page>
+                    </notebook>
+                </sheet>
+                <chatter/>
+            </form>
+        </field>
+    </record>
+
+    <record id="vista_auto_content_request_search" model="ir.ui.view">
+        <field name="name">auto.content.request.search</field>
+        <field name="model">auto.content.request</field>
+        <field name="arch" type="xml">
+            <search>
+                <field name="name"/>
+                <field name="brand_id"/>
+                <field name="operator_id"/>
+                <filter name="pending" string="Pendientes" domain="[('state', 'in', ('review', 'feedback', 'brand', 'error'))]"/>
+                <filter name="approved" string="Aprobadas" domain="[('state', '=', 'approved')]"/>
+                <separator/>
+                <filter name="group_brand" string="Marca" context="{'group_by': 'brand_id'}"/>
+            </search>
+        </field>
+    </record>
+
+    <record id="vista_auto_content_version_form" model="ir.ui.view">
+        <field name="name">auto.content.version.form</field>
+        <field name="model">auto.content.version</field>
+        <field name="arch" type="xml">
+            <form create="false">
+                <header>
+                    <button name="action_download" type="object" string="Descargar" class="btn-primary"/>
+                    <field name="state" widget="statusbar"/>
+                </header>
+                <sheet>
+                    <field name="preview" widget="image" class="oe_avatar" options="{'size': [270, 480]}"
+                           invisible="not preview"/>
+                    <div class="oe_title">
+                        <h1><field name="request_id" readonly="1"/> · v<field name="sequence" readonly="1" class="oe_inline"/></h1>
+                    </div>
+                    <group>
+                        <group>
+                            <field name="brand_id"/>
+                            <field name="design" readonly="1"/>
+                            <field name="place" readonly="1"/>
+                            <field name="sticker" readonly="1"/>
+                            <field name="output_kind" readonly="1"/>
+                            <field name="output_attachment_id"/>
+                        </group>
+                        <group>
+                            <field name="llm_model" readonly="1"/>
+                            <field name="duration" readonly="1"/>
+                            <field name="approved_at"/>
+                            <field name="instruction" readonly="1"/>
+                        </group>
+                    </group>
+                    <group string="Resumen"><field name="summary" readonly="1" nolabel="1" colspan="2"/></group>
+                    <group string="Alertas" invisible="not alerts"><field name="alerts" readonly="1" nolabel="1" colspan="2"/></group>
+                    <group string="Texto sugerido para publicar"><field name="caption" nolabel="1" colspan="2"/></group>
+                    <group string="Plan de la IA" groups="auto_content.grupo_auto_content_admin">
+                        <field name="plan_json" readonly="1" nolabel="1" colspan="2" widget="ace" options="{'mode': 'json'}"/>
+                    </group>
+                </sheet>
+            </form>
+        </field>
+    </record>
+
+    <record id="action_auto_content_request" model="ir.actions.act_window">
+        <field name="name">Solicitudes</field>
+        <field name="res_model">auto.content.request</field>
+        <field name="view_mode">kanban,list,form</field>
+        <field name="context">{'search_default_pending': 0}</field>
+        <field name="help" type="html">
+            <p class="o_view_nocontent_smiling_face">Todavía no hay solicitudes</p>
+            <p>Llegan solas cuando un operador reenvía fotos o videos al WhatsApp de Odoo.</p>
+        </field>
+    </record>
+</odoo>

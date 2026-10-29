@@ -1,0 +1,45 @@
+<?xml version="1.0" encoding="utf-8"?>
+<odoo>
+    <record id="modulo_categoria_auto_content" model="ir.module.category">
+        <field name="name">Contenido automatizado</field>
+        <field name="sequence">31</field>
+    </record>
+
+    <record id="privilegio_auto_content" model="res.groups.privilege">
+        <field name="name">Contenido automatizado</field>
+        <field name="category_id" ref="modulo_categoria_auto_content"/>
+        <field name="sequence">10</field>
+    </record>
+
+    <record id="grupo_auto_content_usuario" model="res.groups">
+        <field name="name">Usuario</field>
+        <field name="privilege_id" ref="privilegio_auto_content"/>
+        <field name="implied_ids" eval="[(4, ref('base.group_user'))]"/>
+    </record>
+
+    <record id="grupo_auto_content_admin" model="res.groups">
+        <field name="name">Administrador</field>
+        <field name="privilege_id" ref="privilegio_auto_content"/>
+        <field name="implied_ids" eval="[(4, ref('grupo_auto_content_usuario'))]"/>
+        <field name="user_ids" eval="[(4, ref('base.user_root')), (4, ref('base.user_admin'))]"/>
+    </record>
+
+    <record id="regla_marca_compania" model="ir.rule">
+        <field name="name">Contenido automatizado: marcas por compañía</field>
+        <field name="model_id" ref="model_auto_content_brand"/>
+        <field name="global" eval="True"/>
+        <field name="domain_force">[('company_id', 'in', company_ids)]</field>
+    </record>
+    <record id="regla_solicitud_compania" model="ir.rule">
+        <field name="name">Contenido automatizado: solicitudes por compañía</field>
+        <field name="model_id" ref="model_auto_content_request"/>
+        <field name="global" eval="True"/>
+        <field name="domain_force">[('company_id', 'in', company_ids)]</field>
+    </record>
+    <record id="regla_operador_compania" model="ir.rule">
+        <field name="name">Contenido automatizado: operadores por compañía</field>
+        <field name="model_id" ref="model_auto_content_operator"/>
+        <field name="global" eval="True"/>
+        <field name="domain_force">[('company_id', 'in', company_ids)]</field>
+    </record>
+</odoo>

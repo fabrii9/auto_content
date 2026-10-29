@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="utf-8"?>
+<odoo>
+    <menuitem id="menu_auto_content_root"
+              name="Contenido automatizado"
+              sequence="46"
+              web_icon="auto_content,static/description/icon.png"
+              groups="auto_content.grupo_auto_content_usuario"/>
+
+    <menuitem id="menu_auto_content_requests"
+              name="Solicitudes"
+              parent="menu_auto_content_root"
+              action="action_auto_content_request"
+              sequence="10"/>
+    <menuitem id="menu_auto_content_versions"
+              name="Versiones"
+              parent="menu_auto_content_root"
+              action="action_auto_content_version"
+              sequence="20"/>
+
+    <menuitem id="menu_auto_content_config"
+              name="Configuración"
+              parent="menu_auto_content_root"
+              sequence="90"
+              groups="auto_content.grupo_auto_content_admin"/>
+    <menuitem id="menu_auto_content_brands"
+              name="Marcas"
+              parent="menu_auto_content_config"
+              action="action_auto_content_brand"
+              sequence="10"/>
+    <menuitem id="menu_auto_content_operators"
+              name="Operadores"
+              parent="menu_auto_content_config"
+              action="action_auto_content_operator"
+              sequence="20"/>
+</odoo>

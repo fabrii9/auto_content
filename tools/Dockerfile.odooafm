@@ -1,0 +1,20 @@
+FROM odoo:18.0
+
+# Instalar como root para que los paquetes queden en /usr/local/lib/...
+# y no sean tapados por el volumen /var/lib/odoo
+USER root
+
+COPY requirements.txt /tmp/requirements.txt
+RUN pip3 install --no-cache-dir --break-system-packages packaging -r /tmp/requirements.txt
+
+# Contenido automatizado (auto_content): Chrome headless arma las piezas y ffmpeg los videos.
+# Chrome va desde el .deb oficial y no por pip, para no tocar greenlet/gevent de Odoo.
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends ffmpeg ca-certificates \
+ && curl -fsSL -o /tmp/chrome.deb https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb \
+ && apt-get install -y --no-install-recommends /tmp/chrome.deb \
+ && rm -f /tmp/chrome.deb \
+ && rm -rf /var/lib/apt/lists/*
+
+USER odoo
+CMD ["/usr/bin/python3", "/mnt/odoo/odoo-bin", "--config=/etc/odoo/odoo.conf"]

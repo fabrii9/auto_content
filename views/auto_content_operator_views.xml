@@ -1,0 +1,65 @@
+<?xml version="1.0" encoding="utf-8"?>
+<odoo>
+    <record id="vista_auto_content_operator_list" model="ir.ui.view">
+        <field name="name">auto.content.operator.list</field>
+        <field name="model">auto.content.operator</field>
+        <field name="arch" type="xml">
+            <list>
+                <field name="name"/>
+                <field name="phone"/>
+                <field name="wa_account_id"/>
+                <field name="brand_id"/>
+                <field name="last_inbound_at"/>
+            </list>
+        </field>
+    </record>
+
+    <record id="vista_auto_content_operator_form" model="ir.ui.view">
+        <field name="name">auto.content.operator.form</field>
+        <field name="model">auto.content.operator</field>
+        <field name="arch" type="xml">
+            <form>
+                <header>
+                    <button name="action_send_test" type="object" string="Enviar mensaje de prueba"/>
+                    <button name="action_mute_sales_agent" type="object" string="Silenciar agente de ventas"/>
+                </header>
+                <sheet>
+                    <widget name="web_ribbon" title="Archivado" bg_color="text-bg-danger" invisible="active"/>
+                    <div class="oe_title">
+                        <h1><field name="name" placeholder="Nombre"/></h1>
+                    </div>
+                    <group>
+                        <group>
+                            <field name="phone" placeholder="+54 9 3777 64-1061"/>
+                            <field name="wa_account_id"/>
+                            <field name="brand_id"/>
+                            <field name="active" invisible="1"/>
+                        </group>
+                        <group>
+                            <field name="debounce_seconds"/>
+                            <field name="wa_id"/>
+                            <field name="last_inbound_at"/>
+                            <field name="company_id" groups="base.group_multi_company"/>
+                        </group>
+                    </group>
+                    <div class="text-muted">
+                        Odoo solo escucha como operador a estos números: el resto de las conversaciones sigue igual.
+                        Al guardar, el agente de ventas deja de responderle a este número.
+                    </div>
+                </sheet>
+            </form>
+        </field>
+    </record>
+
+    <record id="action_auto_content_operator" model="ir.actions.act_window">
+        <field name="name">Operadores</field>
+        <field name="res_model">auto.content.operator</field>
+        <field name="view_mode">list,form</field>
+    </record>
+
+    <record id="action_auto_content_version" model="ir.actions.act_window">
+        <field name="name">Versiones</field>
+        <field name="res_model">auto.content.version</field>
+        <field name="view_mode">list,form</field>
+    </record>
+</odoo>
