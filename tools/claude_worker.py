@@ -46,7 +46,8 @@ WORKER_NAME = socket.gethostname()
 def load_config():
     env_file = Path(__file__).with_name('claude_worker.env')
     if env_file.exists():
-        for line in env_file.read_text(encoding='utf-8').splitlines():
+        # utf-8-sig: PowerShell 5 (y el instalador de Windows) escribe el .env con BOM.
+        for line in env_file.read_text(encoding='utf-8-sig').splitlines():
             line = line.strip()
             if line and not line.startswith('#') and '=' in line:
                 key, value = line.split('=', 1)
