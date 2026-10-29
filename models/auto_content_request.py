@@ -510,7 +510,10 @@ class AutoContentVersion(models.Model):
             if size <= MAX_IMAGE_BYTES:
                 uids.append(sender.media(attachment, 'image', caption=caption))
             uids.append(sender.media(attachment, 'document', caption=_('%s en calidad original') % caption))
-        uids.append(sender.buttons(self._proposal_body(), [
+        # El texto de un mensaje con botones admite 1024 caracteres: el detalle
+        # va en un texto aparte (4096) y los botones con una pregunta corta.
+        uids.append(sender.text(self._proposal_body()))
+        uids.append(sender.buttons(_('¿Qué hacemos con %s · v%d?') % (request.name, self.sequence), [
             ('ac:approve:%d' % self.id, _('Aprobar')),
             ('ac:change:%d' % self.id, _('Cambiar')),
             ('ac:discard:%d' % self.id, _('Descartar')),
