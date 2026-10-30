@@ -16,12 +16,16 @@ from odoo import _, api, fields, models
 from odoo.exceptions import AccessError, UserError
 from odoo.addons.whatsapp.tools.whatsapp_api import WhatsAppApi
 
-from ..services import planner, renderer
-from ..services.whatsapp_out import MAX_IMAGE_BYTES, MAX_VIDEO_BYTES
+from ..services import planner, renderer, video_edit
+from ..services.whatsapp_out import MAX_DOCUMENT_BYTES, MAX_IMAGE_BYTES, MAX_VIDEO_BYTES
 
 _logger = logging.getLogger(__name__)
 
 MAX_MEDIA_FOR_AI = 6
+# Montajes: fotos + hojas de contacto que ve la IA.
+MAX_IMAGES_MONTAGE = 12
+MAX_PHOTOS_MONTAGE = 4
+VIDEO_DEBOUNCE = 180
 STALE_PROCESSING = timedelta(minutes=20)
 REQUEST_STATES = [
     ('collecting', 'Recibiendo'),
@@ -60,6 +64,12 @@ class AutoContentRequest(models.Model):
     preview = fields.Binary(related='current_version_id.preview', string='Vista previa')
     pending_instruction = fields.Text(string='Cambio pedido', readonly=True)
     error_message = fields.Text(string='Error', readonly=True)
+    analysis_json = fields.Text(string='Análisis de los videos', readonly=True, copy=False,
+                                help='Duración, cambios de toma y hojas de contacto de cada video (se calcula una vez).')
+    transcript_json = fields.Text(string='Transcripción', readonly=True, copy=False,
+                                  help='Lo que se dice en los videos, con tiempos (la hace el worker con Whisper).')
+    pending_answer = fields.Text(string='Plan por armar', readonly=True, copy=False)
+    pending_worker = fields.Char(string='Worker del plan', readonly=True, copy=False)
 
     @api.depends('inbound_ids.attachment_id')
     def _compute_media_count(self):
@@ -121,6 +131,9 @@ class AutoContentRequest(models.Model):
     def _bump(self):
         for request in self:
             wait = request.operator_id.debounce_seconds or 90
+            if 'video' in request.inbound_ids.mapped('kind'):
+                # Los videos tardan en subir: se espera más para juntar todos.
+                wait = max(wait, VIDEO_DEBOUNCE)
             request.process_after = fields.Datetime.now() + timedelta(seconds=wait)
 
     def _material(self):
@@ -192,7 +205,9 @@ class AutoContentRequest(models.Model):
     def _run(self, answer=None, worker=None):
         """Arma una versión y la manda. Los errores quedan en la solicitud."""
         self.ensure_one()
-        self.write({'state': 'processing', 'error_message': False})
+        if answer is None and self.pending_answer:
+            answer, worker = self.pending_answer, self.pending_worker
+        self.write({'state': 'processing', 'error_message': False, 'pending_answer': False, 'pending_worker': False})
         self.env['ir.cron']._commit_progress()
         try:
             with self.env.cr.savepoint():
@@ -207,6 +222,16 @@ class AutoContentRequest(models.Model):
                     'No pude armar %(name)s: %(error)s\n\nEscribí "reintentar" para probar de nuevo.'
                 ) % {'name': self.name, 'error': message[:500]})
 
+    def _write_media(self, workdir):
+        """Escribe el material en ``workdir`` y devuelve ``(texts, media)``."""
+        texts, media = self._material()
+        for item in media:
+            attachment = item['attachment']
+            suffix = mimetypes.guess_extension(attachment.mimetype or '') or ('.mp4' if item['kind'] == 'video' else '.jpg')
+            item['path'] = workdir / ('media-%d%s' % (item['index'], suffix))
+            item['path'].write_bytes(attachment.raw)
+        return texts, media
+
     def _prepare_media(self, workdir):
         """Escribe el material en ``workdir``.
 
@@ -214,23 +239,225 @@ class AutoContentRequest(models.Model):
         (un cuadro por video), en el orden de ``media`` y como máximo
         ``MAX_MEDIA_FOR_AI``.
         """
-        texts, media = self._material()
+        texts, media = self._write_media(workdir)
         ffmpeg = None
         images = []
-        for item in media:
-            attachment = item['attachment']
-            suffix = mimetypes.guess_extension(attachment.mimetype or '') or ('.mp4' if item['kind'] == 'video' else '.jpg')
-            item['path'] = workdir / ('media-%d%s' % (item['index'], suffix))
-            item['path'].write_bytes(attachment.raw)
-            if len(images) >= MAX_MEDIA_FOR_AI:
-                continue
+        for item in media[:MAX_MEDIA_FOR_AI]:
             if item['kind'] == 'video':
                 ffmpeg = ffmpeg or renderer.find_ffmpeg(self._param('ffmpeg_path'))
                 frame = renderer.video_frame(item['path'], workdir / ('frame-%d.jpg' % item['index']), ffmpeg)
                 images.append(planner.to_jpeg(frame.read_bytes()))
             else:
-                images.append(planner.to_jpeg(attachment.raw))
+                images.append(planner.to_jpeg(item['attachment'].raw))
         return texts, media, images
+
+    # ------------------------------------------------------------------
+    # Montaje de videos
+    # ------------------------------------------------------------------
+    def _is_montage(self, media):
+        """Con videos y una marca con sección "video", se edita un montaje."""
+        self.ensure_one()
+        return bool(self.brand_id._video_config()) and any(m['kind'] == 'video' for m in media)
+
+    def _video_analysis(self, media, workdir):
+        """Analiza cada video una sola vez (duración, cambios de toma y hojas de
+        contacto, que quedan como adjuntos) y lo guarda en la solicitud."""
+        self.ensure_one()
+        analysis = json.loads(self.analysis_json or '{}')
+        videos = analysis.setdefault('videos', {})
+        ffmpeg = ffprobe = None
+        changed = False
+        for item in media:
+            key = str(item['index'])
+            if item['kind'] != 'video' or key in videos:
+                continue
+            ffmpeg = ffmpeg or renderer.find_ffmpeg(self._param('ffmpeg_path'))
+            ffprobe = ffprobe or video_edit.find_ffprobe(ffmpeg)
+            info = video_edit.probe(item['path'], ffprobe)
+            info['escenas'] = video_edit.scene_changes(item['path'], ffmpeg)
+            info['hojas'] = []
+            sheets = video_edit.contact_sheets(item['path'], info['duracion'], workdir, 'video-%s' % key, ffmpeg)
+            for number, sheet in enumerate(sheets, 1):
+                attachment = self.env['ir.attachment'].sudo().create({
+                    'name': '%s-video%s-hoja%d.jpg' % (self.name.replace('/', ''), key, number),
+                    'raw': sheet['path'].read_bytes(),
+                    'mimetype': 'image/jpeg',
+                    'res_model': self._name,
+                    'res_id': self.id,
+                })
+                info['hojas'].append({'adjunto': attachment.id, 'desde': sheet['desde'],
+                                      'hasta': sheet['hasta'], 'paso': sheet['paso']})
+            videos[key] = info
+            changed = True
+        if changed:
+            self.analysis_json = json.dumps(analysis, ensure_ascii=False)
+        return analysis
+
+    def _montage_context(self, media, analysis=None):
+        """Lo que necesita ``planner.parse_montage`` (sin leer los videos)."""
+        self.ensure_one()
+        analysis = analysis or json.loads(self.analysis_json or '{}')
+        indexes = {str(m['index']) for m in media if m['kind'] == 'video'}
+        return {
+            'cfg': self.brand_id._video_config(),
+            'videos': {k: v for k, v in (analysis.get('videos') or {}).items() if k in indexes},
+            'fotos': [m['index'] for m in media if m['kind'] == 'image'],
+        }
+
+    def _transcripts(self):
+        self.ensure_one()
+        return json.loads(self.transcript_json or '{}')
+
+    def _store_transcripts(self, transcripts):
+        """Guarda las transcripciones del worker: ``{número de video: {'segmentos': [...]}}``."""
+        self.ensure_one()
+        if not isinstance(transcripts, dict):
+            return
+        current = self._transcripts()
+        for key, value in transcripts.items():
+            if isinstance(value, dict) and isinstance(value.get('segmentos'), list):
+                current[str(key)] = value
+        self.transcript_json = json.dumps(current, ensure_ascii=False)
+
+    def _montage_inputs(self, media, analysis):
+        """Fotos y hojas de contacto para la IA, la descripción de cada archivo
+        y el texto con los cambios de toma y lo que se dice."""
+        self.ensure_one()
+        images, ai_media = [], []
+        photos = [m for m in media if m['kind'] == 'image'][:MAX_PHOTOS_MONTAGE]
+        videos = [m for m in media if m['kind'] == 'video']
+        per_video = max(1, (MAX_IMAGES_MONTAGE - len(photos)) // max(1, len(videos)))
+        for item in media:
+            if item['kind'] == 'image':
+                if item in photos:
+                    images.append(planner.to_jpeg(item['attachment'].raw))
+                    detail = _('foto (imagen %d)') % len(images)
+                else:
+                    detail = _('foto (no te la muestro: hay demasiadas)')
+                ai_media.append({'index': item['index'], 'kind': 'image', 'detalle': detail})
+                continue
+            info = analysis['videos'][str(item['index'])]
+            numbers = []
+            for sheet in info['hojas'][:per_video]:
+                attachment = self.env['ir.attachment'].sudo().browse(sheet['adjunto']).exists()
+                if attachment:
+                    images.append(attachment.raw)
+                    numbers.append(str(len(images)))
+            shape = _('vertical') if info['alto'] >= info['ancho'] else _('horizontal')
+            detail = _('video de %(dur).1f s, %(shape)s (%(w)d×%(h)d), %(audio)s.') % {
+                'dur': info['duracion'], 'shape': shape, 'w': info['ancho'], 'h': info['alto'],
+                'audio': _('con sonido') if info['audio'] else _('sin sonido')}
+            if info['escenas']:
+                detail += ' ' + _('Cambios de toma en: %s s.') % ', '.join('%.1f' % t for t in info['escenas'])
+            if numbers:
+                detail += ' ' + _('Hojas de contacto: imágenes %(n)s (un cuadro cada %(step).1f s).') % {
+                    'n': ', '.join(numbers), 'step': info['hojas'][0]['paso']}
+            ai_media.append({'index': item['index'], 'kind': 'video', 'detalle': detail})
+        extra = planner.describe_transcripts(self._transcripts())
+        return images, ai_media, extra
+
+    def _render_montage(self, plan, media, workdir):
+        """Arma el montaje: placas y capas con Chrome, video con ffmpeg."""
+        from PIL import Image, ImageOps
+
+        brand = self.brand_id
+        cfg = brand._video_config()
+        edit = plan['montaje']
+        pack = brand._pack_dir()
+        template = pack / brand.template_path
+        chrome = renderer.find_chrome(self._param('chrome_path'))
+        ffmpeg = renderer.find_ffmpeg(self._param('ffmpeg_path'))
+        width, height = brand.width, brand.height
+        overlap = float(cfg.get('transicion_segundos') or 0.4)
+        analysis = json.loads(self.analysis_json or '{}').get('videos') or {}
+
+        clips = [dict(clip) for clip in edit['clips']]
+        if edit['cierre']:
+            card = renderer.render_html(
+                template, dict(edit['cierre']['datos'], plantilla=edit['cierre']['diseno']),
+                workdir / 'cierre.png', width, height, chrome)
+            length = edit['cierre']['segundos']
+            clips.append({'tipo': 'placa', 'archivo': None, 'imagen': str(card), 'desde': 0.0, 'hasta': length,
+                          'duracion': length, 'velocidad': 1.0, 'estabilizar': False, 'encuadre': 0.5,
+                          'rotulo': None,
+                          'transicion': 'fundido' if 'fundido' in (cfg.get('transiciones') or []) else 'corte'})
+        starts, total = video_edit.timeline(clips, overlap)
+
+        capa = capa_until = None
+        if edit['capa'] != 'ninguna':
+            capa = renderer.render_html(
+                template, dict(plan['datos'], plantilla=plan['diseno'], foto='', transparente=True),
+                workdir / 'capa.png', width, height, chrome, transparent=True)
+            content_end = starts[-1] if edit['cierre'] else total
+            capa_until = min(4.0, content_end) if edit['capa'] == 'inicio' else content_end
+        rotulos = {}
+        if cfg.get('rotulo'):
+            for i, clip in enumerate(clips):
+                if clip.get('rotulo'):
+                    rotulos[i] = renderer.render_html(
+                        template, {'plantilla': cfg['rotulo'], 'texto': clip['rotulo'], 'transparente': True},
+                        workdir / ('rotulo-%d.png' % i), width, height, chrome, transparent=True)
+
+        sources = {}
+        for item in media:
+            if item['kind'] == 'video':
+                info = analysis.get(str(item['index'])) or {}
+                sources[item['index']] = {'path': item['path'], 'audio': info.get('audio', True)}
+            else:
+                # ffmpeg no aplica la orientación EXIF de las fotos.
+                upright = workdir / ('foto-%d.jpg' % item['index'])
+                with Image.open(item['path']) as image:
+                    ImageOps.exif_transpose(image).convert('RGB').save(upright, format='JPEG', quality=92)
+                sources[item['index']] = {'path': upright, 'audio': False}
+
+        music = None
+        track = next((t for t in cfg.get('musica') or [] if t['id'] == edit['musica']), None)
+        if track:
+            music = {'path': pack / track['archivo'], 'volumen': track.get('volumen', 0.25)}
+        style = cfg.get('subtitulos') or {}
+        out, starts, total, events = video_edit.render_montage(
+            clips, sources, workdir / 'pieza.mp4', width, height, ffmpeg, workdir,
+            audio_mode=edit['audio'], music=music, capa=capa, capa_hasta=capa_until, rotulos=rotulos,
+            transcripts=self._transcripts() if edit['subtitulos'] else None, subtitle_style=style,
+            font_path=pack / style['fuente'] if style.get('fuente') else None, default_transition=overlap,
+        )
+        preview = None
+        if out.stat().st_size > MAX_VIDEO_BYTES:
+            preview = video_edit.make_preview(out, workdir / 'vista.mp4', ffmpeg).read_bytes()
+        script = self._montage_script(clips, starts, total, edit, events)
+        return out.read_bytes(), 'video', {'preview': preview, 'script': script}
+
+    def _montage_script(self, clips, starts, total, edit, events):
+        """El guion legible que recibe el operador para pedir cambios."""
+        lines = [_('Guion (%.1f s):') % total]
+        for number, (clip, start) in enumerate(zip(clips, starts), 1):
+            parts = [video_edit.format_time(start)]
+            if number > 1 and clip['transicion'] != 'corte':
+                parts.append(clip['transicion'])
+            if clip['tipo'] == 'video':
+                parts.append(_('video %(n)d de %(a).1f a %(b).1f s') % {
+                    'n': clip['archivo'], 'a': clip['desde'], 'b': clip['hasta']})
+                if clip['velocidad'] != 1:
+                    parts.append(_('velocidad ×%g') % clip['velocidad'])
+                if clip['estabilizar']:
+                    parts.append(_('estabilizado'))
+            elif clip['tipo'] == 'foto':
+                parts.append(_('foto %(n)d (%(d).1f s)') % {'n': clip['archivo'], 'd': clip['duracion']})
+            else:
+                parts.append(_('placa de cierre (%.1f s)') % clip['duracion'])
+            if clip.get('rotulo'):
+                parts.append('«%s»' % clip['rotulo'])
+            lines.append('%d. %s' % (number, ' · '.join(parts)))
+        audio = {'original': _('sonido original'), 'mezcla': _('sonido original + música'),
+                 'musica': _('solo música')}[edit['audio']]
+        if edit['musica']:
+            audio += ' (%s)' % edit['musica']
+        lines.append(_('Audio: %s') % audio)
+        if edit['capa'] != 'ninguna':
+            lines.append(_('Capa de marca: %s') % (_('al inicio') if edit['capa'] == 'inicio' else _('todo el video')))
+        if edit['subtitulos']:
+            lines.append(_('Subtítulos: %d frases') % len(events) if events else _('Subtítulos: no hay transcripción'))
+        return '\n'.join(lines)
 
     def _ai_media(self, media):
         return [{'index': m['index'], 'kind': m['kind']} for m in media][:MAX_MEDIA_FOR_AI]
@@ -262,15 +489,23 @@ class AutoContentRequest(models.Model):
         started = time.monotonic()
         workdir = Path(tempfile.mkdtemp(prefix='auto-content-'))
         try:
-            texts, media, images = self._prepare_media(workdir)
-            ai_media = self._ai_media(media)[:len(images)]
+            texts, media = self._write_media(workdir)
+            montage = None
+            if self._is_montage(media):
+                analysis = self._video_analysis(media, workdir)
+                montage = self._montage_context(media, analysis)
             if answer is None:
-                plan = brand._ai_plan(texts, ai_media, images, self._previous_plan(), instruction)
+                if montage:
+                    images, ai_media, extra = self._montage_inputs(media, analysis)
+                else:
+                    _texts, _media, images = self._prepare_media(workdir)
+                    ai_media, extra = self._ai_media(media)[:len(images)], None
+                plan = brand._ai_plan(texts, ai_media, images, self._previous_plan(), instruction, extra, montage)
                 model = brand.llm_model
             else:
-                plan = planner.parse_plan(answer, brand._designs(), ai_media)
+                plan = planner.parse_plan(answer, brand._designs(), self._ai_media(media), montage)
                 model = 'Claude Code · %s' % (worker or brand.claude_model or '')
-            output, kind = self._render(plan, media, workdir)
+            output, kind, extras = self._render(plan, media, workdir)
         finally:
             shutil.rmtree(workdir, ignore_errors=True)
 
@@ -287,6 +522,7 @@ class AutoContentRequest(models.Model):
             'sticker': plan['sticker'] or False,
             'caption': plan['texto_publicacion'] or False,
             'output_kind': kind,
+            'script': extras.get('script') or False,
             'llm_model': model,
             'duration': time.monotonic() - started,
         })
@@ -298,6 +534,14 @@ class AutoContentRequest(models.Model):
             'res_model': version._name,
             'res_id': version.id,
         })
+        if extras.get('preview'):
+            version.preview_attachment_id = self.env['ir.attachment'].sudo().create({
+                'name': '%s-%s-v%d-vista.mp4' % (brand.code, self.name.replace('/', ''), number),
+                'raw': extras['preview'],
+                'mimetype': 'video/mp4',
+                'res_model': version._name,
+                'res_id': version.id,
+            })
         previous.filtered(lambda v: v.state == 'proposed').write({'state': 'superseded'})
         self.write({'current_version_id': version.id, 'pending_instruction': False, 'state': 'review'})
         self.message_post(
@@ -309,7 +553,9 @@ class AutoContentRequest(models.Model):
         return version
 
     def _render(self, plan, media, workdir):
-        """Devuelve ``(bytes, 'image'|'video')``."""
+        """Devuelve ``(bytes, 'image'|'video', extras)``."""
+        if plan.get('montaje'):
+            return self._render_montage(plan, media, workdir)
         brand = self.brand_id
         template = brand._pack_dir() / brand.template_path
         chrome = renderer.find_chrome(self._param('chrome_path'))
@@ -323,11 +569,11 @@ class AutoContentRequest(models.Model):
             )
             out = renderer.compose_video(chosen['path'], overlay, workdir / 'pieza.mp4',
                                          brand.width, brand.height, ffmpeg)
-            return out.read_bytes(), 'video'
+            return out.read_bytes(), 'video', {}
         if chosen:
             data['foto'] = chosen['path'].resolve().as_uri()
         out = renderer.render_html(template, data, workdir / 'pieza.png', brand.width, brand.height, chrome)
-        return out.read_bytes(), 'image'
+        return out.read_bytes(), 'image', {}
 
     def _param(self, key):
         return self.env['ir.config_parameter'].sudo().get_param('auto_content.%s' % key) or None
@@ -351,12 +597,22 @@ class AutoContentRequest(models.Model):
         for request in self.search([('state', '=', 'waiting_ai')], order='id', limit=max(1, min(limit, 5))):
             brand = request.brand_id
             workdir = Path(tempfile.mkdtemp(prefix='auto-content-job-'))
+            audios = []
             try:
-                texts, media, images = request._prepare_media(workdir)
+                texts, media = request._write_media(workdir)
+                montage = extra = None
+                if request._is_montage(media):
+                    analysis = request._video_analysis(media, workdir)
+                    montage = request._montage_context(media, analysis)
+                    images, ai_media, extra = request._montage_inputs(media, analysis)
+                    audios = request._audios_to_transcribe(media, analysis, workdir)
+                else:
+                    _texts, _media, images = request._prepare_media(workdir)
+                    ai_media = request._ai_media(media)[:len(images)]
             finally:
                 shutil.rmtree(workdir, ignore_errors=True)
             system_text, user_text = brand._prompts(
-                texts, request._ai_media(media)[:len(images)], request._previous_plan(), request.pending_instruction,
+                texts, ai_media, request._previous_plan(), request.pending_instruction, extra, montage,
             )
             request.write({'state': 'processing', 'error_message': False})
             jobs.append({
@@ -367,22 +623,53 @@ class AutoContentRequest(models.Model):
                 'system': system_text,
                 'user': user_text,
                 'images': [base64.b64encode(image).decode() for image in images],
+                # Videos con sonido sin transcribir: el worker los pasa por Whisper
+                # y agrega lo que se dice al prompt.
+                'audios': audios,
             })
         return jobs
 
+    def _audios_to_transcribe(self, media, analysis, workdir):
+        self.ensure_one()
+        done = self._transcripts()
+        ffmpeg = renderer.find_ffmpeg(self._param('ffmpeg_path'))
+        audios = []
+        for item in media:
+            key = str(item['index'])
+            if item['kind'] != 'video' or key in done or not analysis['videos'][key].get('audio'):
+                continue
+            path = video_edit.extract_audio(item['path'], workdir / ('audio-%s.ogg' % key), ffmpeg)
+            if path:
+                audios.append({'video': item['index'], 'datos': base64.b64encode(path.read_bytes()).decode()})
+        return audios
+
     @api.model
-    def worker_submit(self, request_id, answer, worker=None):
+    def worker_submit(self, request_id, answer, worker=None, transcripts=None):
         """Recibe la respuesta del worker. Si el JSON no sirve, devuelve el error
-        para que el worker lo corrija; si sirve, arma la pieza y la manda."""
+        para que el worker lo corrija; si sirve, arma la pieza y la manda.
+
+        Un montaje tarda minutos: queda en cola con el plan y lo arma la tarea
+        automática, así el worker no espera."""
         self._check_worker()
         request = self.browse(request_id).exists()
         if not request or request.state != 'processing':
             return {'ok': False, 'retry': False, 'error': 'La solicitud ya no está tomada por el worker.'}
+        if transcripts:
+            request._store_transcripts(transcripts)
         _texts, media = request._material()
+        montage = request._montage_context(media) if request._is_montage(media) else None
         try:
-            planner.parse_plan(answer, request.brand_id._designs(), request._ai_media(media))
+            plan = planner.parse_plan(answer, request.brand_id._designs(), request._ai_media(media), montage)
         except planner.PlanError as exc:
             return {'ok': False, 'retry': True, 'error': str(exc)}
+        if montage:
+            request.write({'state': 'queued', 'pending_answer': answer, 'pending_worker': worker or False})
+            if request.operator_id:
+                request.operator_id._notify(_('🎬 Editando el video de %(name)s (%(dur).0f s, %(clips)d clips). '
+                                              'Tarda unos minutos.') % {
+                    'name': request.name, 'dur': plan['montaje']['duracion'],
+                    'clips': len(plan['montaje']['clips'])})
+            return {'ok': True, 'retry': False, 'state': 'queued', 'error': False}
         request._run(answer=answer, worker=worker)
         return {'ok': request.state == 'review', 'retry': False, 'state': request.state,
                 'error': request.error_message or False}
@@ -464,6 +751,9 @@ class AutoContentVersion(models.Model):
     caption = fields.Text(string='Texto para publicar')
     output_kind = fields.Selection([('image', 'Imagen'), ('video', 'Video')], string='Tipo')
     output_attachment_id = fields.Many2one('ir.attachment', string='Archivo', readonly=True)
+    preview_attachment_id = fields.Many2one('ir.attachment', string='Vista liviana', readonly=True,
+                                            help='Video comprimido para mandarlo por WhatsApp (máximo 16 MB).')
+    script = fields.Text(string='Guion del montaje')
     preview = fields.Binary(compute='_compute_preview', string='Vista previa')
     llm_model = fields.Char(string='Modelo')
     duration = fields.Float(string='Duración (s)', digits=(10, 1))
@@ -488,9 +778,11 @@ class AutoContentVersion(models.Model):
             lines += ['', self.summary]
         if self.alerts:
             lines += ['', _('⚠️ Revisá:')] + ['• %s' % a for a in self.alerts.splitlines()]
+        if self.script:
+            lines += ['', self.script]
         if self.sticker:
             lines += ['', _('Sticker sugerido: %s') % self.sticker]
-        return '\n'.join(lines)
+        return '\n'.join(lines)[:4000]
 
     def _send_proposal(self):
         """Manda la pieza (vista previa + archivo en calidad original) y los botones."""
@@ -502,10 +794,11 @@ class AutoContentVersion(models.Model):
         uids = []
         caption = '%s · v%d' % (request.name, self.sequence)
         if self.output_kind == 'video':
-            if size <= MAX_VIDEO_BYTES:
-                uids.append(sender.media(attachment, 'video', caption=caption))
-            else:
-                uids.append(sender.media(attachment, 'document', caption=caption))
+            light = attachment if size <= MAX_VIDEO_BYTES else self.preview_attachment_id
+            if light:
+                uids.append(sender.media(light, 'video', caption=caption))
+            if size <= MAX_DOCUMENT_BYTES and (light != attachment or self.script):
+                uids.append(sender.media(attachment, 'document', caption=_('%s en calidad original') % caption))
         else:
             if size <= MAX_IMAGE_BYTES:
                 uids.append(sender.media(attachment, 'image', caption=caption))

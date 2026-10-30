@@ -41,6 +41,8 @@ class AutoContentBrand(models.Model):
     width = fields.Integer(string='Ancho (px)', readonly=True)
     height = fields.Integer(string='Alto (px)', readonly=True)
     designs_json = fields.Text(string='Diseños', readonly=True)
+    video_json = fields.Text(string='Configuración de video', readonly=True,
+                             help='Sección "video" del paquete. Si está, los videos se editan como montaje.')
     instructions = fields.Text(string='Instrucciones del paquete', readonly=True)
     knowledge = fields.Text(string='Conocimiento del paquete', readonly=True)
     test_photo_path = fields.Char(string='Foto de prueba', readonly=True)
@@ -129,6 +131,7 @@ class AutoContentBrand(models.Model):
                 'width': manifest['ancho'],
                 'height': manifest['alto'],
                 'designs_json': json.dumps(manifest['disenos'], ensure_ascii=False, indent=2),
+                'video_json': json.dumps(manifest['video'], ensure_ascii=False, indent=2) if manifest.get('video') else False,
                 'instructions': texts['instrucciones'],
                 'knowledge': texts['conocimiento'],
                 'test_photo_path': manifest.get('foto_prueba') or False,
@@ -156,6 +159,13 @@ class AutoContentBrand(models.Model):
         self.ensure_one()
         return json.loads(self.designs_json or '{}')
 
+    def _video_config(self):
+        """La sección "video" del paquete con el tamaño de la pieza, o ``None``."""
+        self.ensure_one()
+        if not self.video_json:
+            return None
+        return dict(json.loads(self.video_json), ancho=self.width, alto=self.height)
+
     def _places(self):
         self.ensure_one()
         return [
@@ -166,22 +176,23 @@ class AutoContentBrand(models.Model):
     # ------------------------------------------------------------------
     # IA
     # ------------------------------------------------------------------
-    def _prompts(self, texts, media, previous_plan=None, instruction=None):
+    def _prompts(self, texts, media, previous_plan=None, instruction=None, extra=None, montage=None):
         """``(system, user)`` para la IA; los mismos en los dos modos."""
         self.ensure_one()
         system_text = planner.build_system_prompt(
             self.name, self._designs(), self._places(), self.instructions, self.knowledge, self.extra_instructions,
+            video=montage['cfg'] if montage else None,
         )
-        return system_text, planner.build_user_prompt(texts, media, previous_plan, instruction)
+        return system_text, planner.build_user_prompt(texts, media, previous_plan, instruction, extra)
 
-    def _ai_plan(self, texts, media, images, previous_plan=None, instruction=None):
+    def _ai_plan(self, texts, media, images, previous_plan=None, instruction=None, extra=None, montage=None):
         """Pide el plan al proveedor por API. ``images`` son JPEG en el orden de ``media``."""
         self.ensure_one()
         provider = self.llm_provider_id.sudo()
         if not provider:
             raise UserError(_('Configurá el proveedor de IA de la marca %s.') % self.name)
         designs = self._designs()
-        system_text, user_text = self._prompts(texts, media, previous_plan, instruction)
+        system_text, user_text = self._prompts(texts, media, previous_plan, instruction, extra, montage)
         messages = planner.build_messages(provider.provider_type, system_text, user_text, images)
         extra = {}
         if provider.provider_type in ('openai', 'custom', 'kimi', 'groq'):
@@ -191,7 +202,7 @@ class AutoContentBrand(models.Model):
             max_tokens=self.llm_max_tokens, **extra,
         )
         try:
-            return planner.parse_plan(answer, designs, media)
+            return planner.parse_plan(answer, designs, media, montage)
         except planner.PlanError as first_error:
             _logger.warning('auto_content: plan inválido (%s), reintento una vez.', first_error)
             messages += [
@@ -202,7 +213,7 @@ class AutoContentBrand(models.Model):
                 messages, model=self.llm_model or None, temperature=self.llm_temperature,
                 max_tokens=self.llm_max_tokens, **extra,
             )
-            return planner.parse_plan(answer, designs, media)
+            return planner.parse_plan(answer, designs, media, montage)
 
     def action_test(self):
         """Arma una pieza de prueba con la foto y el texto de prueba del paquete,

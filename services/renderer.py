@@ -31,15 +31,20 @@ class RenderError(RuntimeError):
 
 
 def _lift_memory_limit():
-    """Los workers de Odoo limitan la memoria virtual (limit_memory_hard) y los
-    procesos hijos lo heredan; Chromium reserva mucho más al arrancar y muere.
-    Se levanta solo en el proceso hijo, hasta el límite duro del sistema."""
+    """Los workers de Odoo limitan la memoria virtual (limit_memory_hard) y el
+    tiempo de CPU (limit_time_cpu), y los procesos hijos lo heredan: Chromium
+    reserva mucha más memoria al arrancar y un montaje largo de ffmpeg suma
+    más CPU. Se levantan solo en el proceso hijo, hasta el límite duro."""
     try:
         import resource
-        _soft, hard = resource.getrlimit(resource.RLIMIT_AS)
-        resource.setrlimit(resource.RLIMIT_AS, (hard, hard))
-    except (ImportError, ValueError, OSError):
-        pass
+    except ImportError:
+        return
+    for limit in (resource.RLIMIT_AS, resource.RLIMIT_CPU):
+        try:
+            _soft, hard = resource.getrlimit(limit)
+            resource.setrlimit(limit, (hard, hard))
+        except (ValueError, OSError):
+            pass
 
 
 _CHILD = {'preexec_fn': _lift_memory_limit} if os.name == 'posix' else {}

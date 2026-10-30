@@ -26,6 +26,49 @@ Es un módulo aparte y para varios clientes: depende de `mail`, `whatsapp` y `ll
 - `reintentar`: vuelve a intentar la última solicitud que falló.
 - `ok` / `descartar`: equivalen a los botones.
 
+## Montajes de video
+
+Si el paquete de marca tiene una sección `video` y llegan videos, el resultado es **un solo video editado** que combina las mejores partes de todo el material:
+
+1. **Análisis.** Odoo analiza cada video una sola vez y guarda el resultado en la solicitud, en la pestaña *Análisis de videos*:
+   - duración, orientación y si tiene sonido;
+   - los segundos donde cambia la toma;
+   - hojas de contacto: cuadros repartidos en todo el video, con el segundo escrito en cada uno.
+2. **Transcripción.** En modo Claude Code, el worker transcribe lo que se dice con `faster-whisper` en la PC y se lo pasa a la IA y a Odoo (para los subtítulos).
+3. **Guion.** La IA mira las hojas y devuelve un guion (`montaje`):
+   - clips con `desde`/`hasta`, transición, velocidad, estabilización, encuadre y rótulo;
+   - audio (`original`, `mezcla` con música que baja cuando alguien habla, o `musica`);
+   - pista, subtítulos, capa de marca y placa de cierre.
+   Odoo lo valida: que los tiempos existan y que no supere la duración máxima.
+4. **Render.** ffmpeg arma el video en el servidor, con prioridad baja y por tramos para usar poca memoria:
+   1. normaliza cada clip a 1080×1920 y 30 fps;
+   2. hace las transiciones (`xfade`);
+   3. suma las capas y rótulos de la plantilla (Chrome), los subtítulos (ASS con la fuente de la marca) y la música;
+   4. normaliza el volumen.
+5. **Propuesta.** Al operador le llegan cuatro cosas:
+   - el video, en una versión liviana si pesa más de 16 MB;
+   - el archivo en calidad original;
+   - el detalle con el **guion legible** (para pedir cambios como "sacá el clip 2");
+   - los botones.
+
+Sección `video` de `marca.json`:
+
+```json
+"video": {
+  "duracion_max": 60,
+  "transicion_segundos": 0.4,
+  "transiciones": ["corte", "fundido", "negro", "barrido", "zoom"],
+  "rotulo": "rotulo",
+  "subtitulos": {"fuente": "assets/fuentes/X.ttf", "familia": "X", "tamano": 62, "color": "#FFFFFF", "borde": "#0B1E3F", "margen_inferior": 700},
+  "musica": [{"id": "energica-1", "archivo": "assets/musica/energica-1.mp3", "animo": "energética", "descripcion": "...", "volumen": 0.22}]
+}
+```
+
+- `rotulo` es el diseño de la plantilla para los rótulos: transparente, recibe `texto`.
+- Las transiciones posibles son `corte`, `fundido`, `disolver`, `negro`, `blanco`, `barrido`, `deslizar`, `zoom` y `circulo`.
+- Con videos, la espera para juntar material es de al menos 180 s.
+- Para que los videos lleguen sin compresión, conviene mandarlos **como documento**.
+
 ## Modo de IA: Claude Code (sin API)
 
 Cada marca elige su modo de IA:
@@ -41,6 +84,8 @@ Cómo se pone en marcha el worker:
 4. Probá con `python3 claude_worker.py --once`. Después dejalo corriendo como servicio: `launchd` en macOS, `systemd` en Linux o el Programador de tareas en Windows.
 
 **En Windows** hacé todo con `tools/instalar_worker_windows.ps1`. Pide los datos de Odoo, hace una prueba y crea una tarea programada que arranca al iniciar sesión y se reinicia si el worker se cae. Instalalo con el mismo usuario de Windows que está logueado en Claude Code. Si querés que vuelva a arrancar solo después de un corte de luz, activá el inicio de sesión automático.
+
+Para montajes con subtítulos, instalá también `faster-whisper` en la PC (`pip install faster-whisper`). La primera vez baja el modelo (`AC_WHISPER_MODEL`, por defecto `small`).
 
 Claude Code solo corre cuando hay trabajo, y lo hace con `--tools Read`: lo único que puede hacer es leer las imágenes de la solicitud. Usá siempre el Claude Code oficial, sin modificar y con tu cuenta, para tu trabajo y con un volumen razonable. No extraigas el token para usarlo desde otros programas.
 

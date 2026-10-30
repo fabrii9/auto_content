@@ -18,6 +18,12 @@ al script, con líneas CLAVE=valor):
     AC_CLAUDE=claude        # ruta al ejecutable si no está en el PATH
     AC_TIMEOUT=600          # segundos máximos por ejecución de Claude
     AC_LOG=                 # archivo de log (vacío: consola)
+    AC_WHISPER_MODEL=small  # modelo de faster-whisper para transcribir videos
+
+Para los montajes de video, si está instalado ``faster-whisper`` (``pip
+install faster-whisper``) el worker transcribe lo que se dice en los videos
+en esta PC y se lo pasa a la IA y a Odoo (para los subtítulos). Sin él, los
+montajes salen igual pero sin subtítulos.
 
 Uso:
     python3 claude_worker.py            # queda corriendo
@@ -88,12 +94,60 @@ class Odoo:
         return self.models.execute_kw(self.cfg['db'], self.uid, self.cfg['key'], MODEL, method, list(args))
 
 
-def build_prompt(job, image_names):
-    images = '\n'.join('- %s (archivo %d)' % (name, i) for i, name in enumerate(image_names, 1))
+_whisper = None
+
+
+def transcribe(audios, workdir):
+    """Transcribe los audios del trabajo con faster-whisper, si está instalado.
+
+    Devuelve ``{número de video: {'segmentos': [...]}}`` con tiempos por palabra.
+    """
+    global _whisper
+    if not audios:
+        return {}
+    try:
+        from faster_whisper import WhisperModel
+    except ImportError:
+        log.warning('faster-whisper no está instalado: el montaje sale sin transcripción ni subtítulos.')
+        return {}
+    if _whisper is None:
+        name = os.environ.get('AC_WHISPER_MODEL', 'small')
+        log.info('Cargando Whisper (%s)…', name)
+        _whisper = WhisperModel(name, device='cpu', compute_type='int8')
+    result = {}
+    for audio in audios:
+        path = Path(workdir, 'audio-%s.ogg' % audio['video'])
+        path.write_bytes(base64.b64decode(audio['datos']))
+        segments, _info = _whisper.transcribe(str(path), language='es', word_timestamps=True, vad_filter=True)
+        result[str(audio['video'])] = {'segmentos': [{
+            'inicio': round(seg.start, 2),
+            'fin': round(seg.end, 2),
+            'texto': seg.text.strip(),
+            'palabras': [{'inicio': round(w.start, 2), 'fin': round(w.end, 2), 'texto': w.word.strip()}
+                         for w in seg.words or []],
+        } for seg in segments]}
+        log.info('Video %s: %d frase(s) transcriptas', audio['video'], len(result[str(audio['video'])]['segmentos']))
+    return result
+
+
+def describe_transcripts(transcripts):
+    """Mismo formato que ``planner.describe_transcripts`` en Odoo."""
+    blocks = []
+    for key in sorted(transcripts, key=int):
+        lines = ['[%.1f–%.1f] %s' % (s['inicio'], s['fin'], s['texto'])
+                 for s in transcripts[key]['segmentos'] if s['texto']]
+        blocks.append('Video %s:\n%s' % (key, '\n'.join(lines) or '(no se entiende nada que se diga)'))
+    return '## Lo que se dice en los videos (segundos del video original)\n' + '\n\n'.join(blocks)
+
+
+def build_prompt(job, image_names, transcripts=None):
+    images = '\n'.join('- %s (imagen %d)' % (name, i) for i, name in enumerate(image_names, 1))
+    spoken = '\n\n' + describe_transcripts(transcripts) if transcripts else ''
     return (
         job['system']
         + '\n\n# Material de esta solicitud\n'
         + job['user']
+        + spoken
         + '\n\n# Imágenes\nEstán en el directorio actual. Leé cada una con la herramienta Read antes de decidir:\n'
         + (images or '(no hay imágenes)')
         + '\n\nRespondé solo con el objeto JSON pedido, sin texto antes ni después.'
@@ -104,7 +158,7 @@ def run_claude(cfg, model, prompt, workdir):
     command = [
         cfg['claude'], '-p', '--output-format', 'json', '--model', model,
         '--tools', 'Read', '--allowedTools', 'Read',
-        '--max-turns', '15', '--no-session-persistence',
+        '--max-turns', '30', '--no-session-persistence',
     ]
     result = subprocess.run(command, input=prompt, capture_output=True, text=True, encoding='utf-8',
                             errors='replace', cwd=workdir, timeout=cfg['timeout'])
@@ -127,10 +181,16 @@ def process(odoo, cfg, job):
             name = 'media-%d.jpg' % i
             Path(workdir, name).write_bytes(base64.b64decode(image))
             names.append(name)
-        prompt = build_prompt(job, names)
+        try:
+            transcripts = transcribe(job.get('audios'), workdir)
+        except Exception:
+            log.exception('%s: no pude transcribir; sigo sin transcripción', job['name'])
+            transcripts = {}
+        prompt = build_prompt(job, names, transcripts)
         for attempt in (1, 2):
             answer = run_claude(cfg, job['model'], prompt, workdir)
-            result = odoo.call('worker_submit', job['id'], answer, '%s@%s' % (job['model'], WORKER_NAME))
+            result = odoo.call('worker_submit', job['id'], answer, '%s@%s' % (job['model'], WORKER_NAME),
+                               transcripts or None)
             if result.get('ok'):
                 log.info('%s: lista (%s)', job['name'], result.get('state'))
                 return

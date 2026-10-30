@@ -29,6 +29,8 @@ import tempfile
 import zipfile
 from pathlib import Path, PurePosixPath
 
+from .video_edit import TRANSITIONS
+
 MANIFEST = 'marca.json'
 MAX_PACK_BYTES = 60 * 1024 * 1024
 MEDIA_MODES = ('requerida', 'opcional', 'no')
@@ -113,11 +115,34 @@ def read_pack(data):
             knowledge = [knowledge]
         texts['conocimiento'] = '\n\n'.join(_read_text(zf, names, path) for path in knowledge)
 
+        _check_video(manifest.get('video'), names)
+
         for key in ('foto_prueba',):
             if manifest.get(key) and manifest[key] not in names:
                 raise PackError('No está %s (%s) en el paquete.' % (manifest[key], key))
 
     return manifest, texts, hashlib.sha256(data).hexdigest()
+
+
+def _check_video(video, names):
+    """Valida la sección opcional "video" (montajes)."""
+    if video is None:
+        return
+    if not isinstance(video, dict):
+        raise PackError('"video" tiene que ser un objeto.')
+    limit = video.get('duracion_max', 60)
+    if not isinstance(limit, (int, float)) or not 5 <= limit <= 180:
+        raise PackError('"video.duracion_max" tiene que estar entre 5 y 180 segundos.')
+    unknown = [t for t in video.get('transiciones') or [] if t not in TRANSITIONS]
+    if unknown:
+        raise PackError('Transiciones desconocidas en "video": %s (se puede usar %s).' % (
+            ', '.join(unknown), ', '.join(TRANSITIONS)))
+    for track in video.get('musica') or []:
+        if not isinstance(track, dict) or not track.get('id') or track.get('archivo') not in names:
+            raise PackError('Cada pista de "video.musica" necesita "id" y un "archivo" que esté en el paquete.')
+    font = (video.get('subtitulos') or {}).get('fuente')
+    if font and font not in names:
+        raise PackError('No está la fuente de subtítulos %s en el paquete.' % font)
 
 
 def extract_pack(data, checksum, cache_key):

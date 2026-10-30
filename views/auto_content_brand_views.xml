@@ -74,6 +74,7 @@
                         </page>
                         <page string="Diseños" name="designs">
                             <field name="designs_json" widget="ace" options="{'mode': 'json'}"/>
+                            <field name="video_json" widget="ace" options="{'mode': 'json'}"/>
                         </page>
                         <page string="Instrucciones del paquete" name="instructions">
                             <field name="instructions"/>
