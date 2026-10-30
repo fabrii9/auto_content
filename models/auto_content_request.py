@@ -402,7 +402,8 @@ class AutoContentRequest(models.Model):
         for item in media:
             if item['kind'] == 'video':
                 info = analysis.get(str(item['index'])) or {}
-                sources[item['index']] = {'path': item['path'], 'audio': info.get('audio', True)}
+                sources[item['index']] = {'path': item['path'], 'audio': info.get('audio', True),
+                                          'ancho': info.get('ancho'), 'alto': info.get('alto')}
             else:
                 # ffmpeg no aplica la orientación EXIF de las fotos.
                 upright = workdir / ('foto-%d.jpg' % item['index'])
@@ -423,7 +424,8 @@ class AutoContentRequest(models.Model):
         )
         preview = None
         if out.stat().st_size > MAX_VIDEO_BYTES:
-            preview = video_edit.make_preview(out, workdir / 'vista.mp4', ffmpeg).read_bytes()
+            preview = video_edit.make_preview(out, workdir / 'vista.mp4', ffmpeg, total,
+                                              MAX_VIDEO_BYTES - 512 * 1024).read_bytes()
         script = self._montage_script(clips, starts, total, edit, events)
         return out.read_bytes(), 'video', {'preview': preview, 'script': script}
 

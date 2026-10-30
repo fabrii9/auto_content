@@ -68,7 +68,7 @@ Además de las claves de siempre, respondé con la clave "montaje":
 Reglas del montaje:
 - Clips en el orden en que se ven. Duración total máxima: {duracion_max} s (las transiciones se superponen {transicion} s). Lo normal es 15 a 40 s, con clips de 2 a 5 s.
 - "transicion" es cómo entra cada clip (en el primero no se usa): {transiciones}. Usá "corte" para el ritmo y las otras con moderación.
-- "velocidad" entre 0.5 (cámara lenta) y 2 (rápido). "estabilizar": true solo si la toma se mueve mucho. "encuadre" (0 a 1) corre el recorte de una toma horizontal: 0 izquierda, 0.5 centro, 1 derecha.
+- "velocidad" entre 0.5 (cámara lenta) y 2 (rápido). "estabilizar": true solo si la toma se mueve mucho. "encuadre" (0 a 1) corre el recorte de una toma horizontal: 0 izquierda, 0.5 centro, 1 derecha; "completo" muestra la toma horizontal entera sobre un fondo desenfocado (el sistema lo usa solo si la toma tiene poca resolución).
 - "rotulo": texto corto (hasta 40 caracteres) que aparece abajo durante ese clip. Solo datos del material; null si no hace falta.
 - "audio": "original" deja el sonido de los videos; "mezcla" suma música baja que se corre cuando alguien habla; "musica" tapa el sonido original con la música (para tomas con ruido sin interés).
 - Si nadie habla, poné música: "mezcla" si el sonido ambiente suma (máquinas, obra) o "musica" si es ruido. Elegí la pista según el ánimo del material.
@@ -290,7 +290,8 @@ def parse_montage(raw, designs, montage):
                 'tipo': 'video', 'archivo': index, 'desde': round(start, 2), 'hasta': round(end, 2),
                 'duracion': frames((end - start) / speed), 'velocidad': speed,
                 'estabilizar': bool(item.get('estabilizar')),
-                'encuadre': min(1.0, max(0.0, _number(item.get('encuadre'), 0.5))),
+                'encuadre': 'completo' if item.get('encuadre') == 'completo'
+                else min(1.0, max(0.0, _number(item.get('encuadre'), 0.5))),
             })
         elif item.get('foto') is not None:
             index = _index(item.get('foto'))

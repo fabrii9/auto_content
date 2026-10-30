@@ -324,10 +324,39 @@ def build_ass(events, style, width, height):
 # ----------------------------------------------------------------------
 # Render
 # ----------------------------------------------------------------------
-def _fit(width, height, focus=0.5):
-    """Cubre el cuadro y recorta; ``focus`` corre el recorte horizontal (0 izquierda, 1 derecha)."""
-    return ('scale=%(w)d:%(h)d:force_original_aspect_ratio=increase,'
-            'crop=%(w)d:%(h)d:(iw-%(w)d)*%(f).3f:(ih-%(h)d)/2') % {'w': width, 'h': height, 'f': focus}
+MAX_CROP_ZOOM = 2.0
+
+
+def _fit(width, height, focus=0.5, source_size=None):
+    """Lleva la toma al cuadro final.
+
+    - Recorte: cubre el cuadro y recorta; ``focus`` corre el recorte
+      horizontal (0 izquierda, 1 derecha).
+    - ``"completo"``: la toma entera, centrada, sobre una copia desenfocada
+      de sí misma. Se usa solo cuando recortar obligaría a agrandar la imagen
+      más de ``MAX_CROP_ZOOM`` veces (típico: un video horizontal de WhatsApp),
+      porque así se pixela mucho menos.
+
+    Si hay que agrandar, primero se limpia el ruido de compresión y después
+    se enfoca un poco.
+    """
+    src_w, src_h = source_size or (width, height)
+    cover = max(width / max(src_w, 1), height / max(src_h, 1))
+    fit = min(width / max(src_w, 1), height / max(src_h, 1))
+    whole = focus == 'completo' or cover > MAX_CROP_ZOOM
+    zoom = fit if whole else cover
+    clean = 'hqdn3d=2:1.5:4:3,' if zoom > 1.3 else ''
+    sharpen = ',unsharp=5:5:0.6:5:5:0' if zoom > 1.3 else ''
+    values = {'w': width, 'h': height, 'f': 0.5 if whole or not isinstance(focus, (int, float)) else focus,
+              'bw': width // 8, 'bh': height // 8}
+    if not whole:
+        return (clean + 'scale=%(w)d:%(h)d:force_original_aspect_ratio=increase:flags=lanczos,'
+                'crop=%(w)d:%(h)d:(iw-%(w)d)*%(f).3f:(ih-%(h)d)/2' % values + sharpen)
+    return (clean + 'split=2[fondo0][toma0];'
+            '[fondo0]scale=%(bw)d:%(bh)d:force_original_aspect_ratio=increase,crop=%(bw)d:%(bh)d,'
+            'boxblur=4:2,scale=%(w)d:%(h)d,eq=brightness=-0.12:saturation=0.8[fondo];'
+            '[toma0]scale=%(w)d:%(h)d:force_original_aspect_ratio=decrease:flags=lanczos' % values
+            + sharpen + '[toma];[fondo][toma]overlay=(W-w)/2:(H-h)/2')
 
 
 def _video_segment(clip, source, out, width, height, ffmpeg, workdir, keep_audio):
@@ -341,7 +370,8 @@ def _video_segment(clip, source, out, width, height, ffmpeg, workdir, keep_audio
         filters.append('vidstabtransform=input=%s:smoothing=20:zoom=3,unsharp=5:5:0.6:3:3:0.3' % transforms)
     if speed != 1:
         filters.append('setpts=PTS/%s' % speed)
-    filters += [_fit(width, height, clip.get('encuadre', 0.5)), 'fps=%d' % FPS, 'setsar=1', 'format=yuv420p']
+    size = (source['ancho'], source['alto']) if source.get('ancho') else None
+    filters += [_fit(width, height, clip.get('encuadre', 0.5), size), 'fps=%d' % FPS, 'setsar=1', 'format=yuv420p']
     command = [ffmpeg, '-y', '-loglevel', 'error', '-ss', start, '-t', length, '-i', source['path']]
     if keep_audio and source.get('audio'):
         audio = 'aresample=48000,aformat=channel_layouts=stereo'
@@ -518,10 +548,17 @@ def render_montage(clips, sources, out_path, width, height, ffmpeg, workdir, *,
     return Path(out_path), starts, total, events
 
 
-def make_preview(video_path, out_path, ffmpeg, width=720, height=1280):
-    """Versión liviana (hasta ~1,5 Mb/s) para mandar como video por WhatsApp."""
+def make_preview(video_path, out_path, ffmpeg, duration, max_bytes, width=1080, height=1920):
+    """Versión para mandar como video por WhatsApp: la mejor calidad que entra
+    en ``max_bytes``. Si alcanza, queda en tamaño completo; si no, en 720p."""
+    audio_kbps = 128
+    video_kbps = int(max_bytes * 8 * 0.9 / max(duration, 1) / 1000) - audio_kbps
+    if video_kbps < 4500:
+        width, height = 720, 1280
+    video_kbps = max(800, min(video_kbps, 9000))
     _run([ffmpeg, '-y', '-loglevel', 'error', '-i', video_path,
-          '-vf', 'scale=%d:%d' % (width, height), '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '27',
-          '-maxrate', '1500k', '-bufsize', '3000k', '-pix_fmt', 'yuv420p',
-          '-c:a', 'aac', '-b:a', '96k', '-movflags', '+faststart', out_path], timeout=300)
+          '-vf', 'scale=%d:%d:flags=lanczos' % (width, height), '-c:v', 'libx264', '-preset', 'medium',
+          '-b:v', '%dk' % video_kbps, '-maxrate', '%dk' % int(video_kbps * 1.2), '-bufsize', '%dk' % (video_kbps * 2),
+          '-pix_fmt', 'yuv420p', '-c:a', 'aac', '-b:a', '%dk' % audio_kbps, '-movflags', '+faststart', out_path],
+         timeout=300)
     return Path(out_path)
