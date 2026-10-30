@@ -25,7 +25,7 @@ MAX_MEDIA_FOR_AI = 6
 # Montajes: fotos + hojas de contacto que ve la IA.
 MAX_IMAGES_MONTAGE = 12
 MAX_PHOTOS_MONTAGE = 4
-VIDEO_DEBOUNCE = 180
+VIDEO_DEBOUNCE = 120
 STALE_PROCESSING = timedelta(minutes=20)
 REQUEST_STATES = [
     ('collecting', 'Recibiendo'),
@@ -135,6 +135,13 @@ class AutoContentRequest(models.Model):
                 # Los videos tardan en subir: se espera más para juntar todos.
                 wait = max(wait, VIDEO_DEBOUNCE)
             request.process_after = fields.Datetime.now() + timedelta(seconds=wait)
+            request._trigger_cron(request.process_after)
+
+    def _trigger_cron(self, at=None):
+        """Despierta la tarea automática (sin esperar a su próximo minuto)."""
+        cron = self.env.ref('auto_content.cron_procesar_solicitudes', raise_if_not_found=False)
+        if cron:
+            cron.sudo()._trigger(at)
 
     def _material(self):
         """Textos y archivos del material, en orden de llegada."""
@@ -676,6 +683,7 @@ class AutoContentRequest(models.Model):
             return {'ok': False, 'retry': True, 'error': str(exc)}
         if montage:
             request.write({'state': 'queued', 'pending_answer': answer, 'pending_worker': worker or False})
+            request._trigger_cron()
             if request.operator_id:
                 request.operator_id._notify(_('🎬 Editando el video de %(name)s (%(dur).0f s, %(clips)d clips). '
                                               'Tarda unos minutos.') % {
@@ -705,6 +713,7 @@ class AutoContentRequest(models.Model):
     def _request_change(self, instruction):
         self.ensure_one()
         self.write({'pending_instruction': instruction, 'state': 'queued'})
+        self._trigger_cron()
         if self.operator_id:
             self.operator_id._notify(_('Dale, armo otra versión de %s.') % self.name)
 

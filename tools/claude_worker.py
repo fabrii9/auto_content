@@ -14,7 +14,7 @@ al script, con líneas CLAVE=valor):
     AC_ODOO_DB=Aftermoves_Produccion
     AC_ODOO_USER=usuario@aftermoves.com
     AC_ODOO_KEY=<API key de Odoo del usuario>
-    AC_INTERVAL=30          # segundos entre consultas
+    AC_INTERVAL=10          # segundos entre consultas
     AC_CLAUDE=claude        # ruta al ejecutable si no está en el PATH
     AC_TIMEOUT=600          # segundos máximos por ejecución de Claude
     AC_LOG=                 # archivo de log (vacío: consola)
@@ -69,7 +69,7 @@ def load_config():
         'db': os.environ['AC_ODOO_DB'],
         'user': os.environ['AC_ODOO_USER'],
         'key': os.environ['AC_ODOO_KEY'],
-        'interval': int(os.environ.get('AC_INTERVAL', '30')),
+        'interval': int(os.environ.get('AC_INTERVAL', '10')),
         'timeout': int(os.environ.get('AC_TIMEOUT', '600')),
         'claude': claude,
     }

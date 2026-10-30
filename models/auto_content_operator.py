@@ -15,6 +15,9 @@ APPROVE_WORDS = {'aprobar', 'aprobado', 'aprobada', 'ok', 'dale', 'si', 'sí', '
 DISCARD_WORDS = {'descartar', 'descartada', 'no', 'borrar'}
 RETRY_WORDS = {'reintentar', 'reintenta', 'reintentá'}
 HELP_WORDS = {'ayuda', 'help', '?', 'marcas', '#marcas', '#ayuda'}
+START_WORDS = {'listo', 'lista', 'arranca', 'arrancá', 'empeza', 'empezá', 'eso es todo', 'nada mas', 'nada más'}
+STATUS_WORDS = {'estado', 'como venis', 'cómo venís', 'como va', 'cómo va', 'como vas', 'novedades', 'y', 'y?'}
+IN_PROGRESS = ('queued', 'waiting_ai', 'processing')
 SUPPORTED_MEDIA = ('image', 'video', 'document')
 
 
@@ -142,6 +145,7 @@ class AutoContentOperator(models.Model):
             '• Marca activa: %(active)s\n'
             '• Para cambiarla, escribí el código: %(brands)s\n'
             '• En la propuesta: Aprobar, Cambiar o Descartar.\n'
+            '• "listo" arranca sin esperar; "estado" te dice cómo va.\n'
             '• "reintentar" vuelve a intentar la última que falló.'
         ) % {
             'wait': self.debounce_seconds,
@@ -246,13 +250,30 @@ class AutoContentOperator(models.Model):
             self._notify(self._help_text())
             return
 
+        collecting = Request.search([('operator_id', '=', self.id), ('state', '=', 'collecting')], limit=1)
+        if collecting and low in START_WORDS:
+            Message.create({'msg_uid': msg_uid, 'operator_id': self.id, 'kind': 'text', 'body': body})
+            collecting.process_after = fields.Datetime.now()
+            collecting._trigger_cron()
+            self._notify(_('Arranco con %s.') % collecting.name)
+            return
+        in_feedback = Request.search_count([('operator_id', '=', self.id), ('state', '=', 'feedback')])
+        if low in STATUS_WORDS and not in_feedback:
+            Message.create({'msg_uid': msg_uid, 'operator_id': self.id, 'kind': 'text', 'body': body})
+            self._notify(self._status_text())
+            return
+
         waiting_change = Request.search([('operator_id', '=', self.id), ('state', '=', 'feedback')], limit=1)
         if not waiting_change and quoted_uid:
             version = self.env['auto.content.version'].sudo().search(
                 [('wa_msg_uids', 'ilike', quoted_uid), ('request_id.operator_id', '=', self.id)], limit=1,
             )
-            if version and version.request_id.state == 'review':
+            # Citar una propuesta pide un cambio sobre esa versión, aunque la solicitud
+            # ya se haya aprobado o descartado.
+            if version and version.request_id.state in ('review', 'approved', 'discarded'):
                 waiting_change = version.request_id
+                if waiting_change.current_version_id != version:
+                    waiting_change.current_version_id = version
         if waiting_change:
             waiting_change._add_inbound(msg_uid, 'text', body=body, counts_as_material=False)
             waiting_change._request_change(body)
@@ -278,9 +299,38 @@ class AutoContentOperator(models.Model):
                 self._notify(_('No hay ninguna solicitud con error.'))
             return
 
+        recent = fields.Datetime.now() - timedelta(minutes=30)
+        running = Request.search([('operator_id', '=', self.id), ('state', 'in', IN_PROGRESS),
+                                  ('create_date', '>=', recent)], order='id desc', limit=1)
+        if not collecting and running:
+            # Un texto suelto mientras se arma algo es casi siempre una aclaración de eso.
+            running._add_inbound(msg_uid, 'text', body=body)
+            if running.state == 'processing':
+                self._notify(_('Lo anoto en %s, que ya se está armando. Si la propuesta no lo tiene, '
+                               'pedilo con "Cambiar".') % running.name)
+            else:
+                self._notify(_('Lo sumo a %s.') % running.name)
+            return
+
         request = self._collecting_request()
         request._add_inbound(msg_uid, 'text', body=body)
         request._bump()
+
+    def _status_text(self):
+        self.ensure_one()
+        Request = self.env['auto.content.request'].sudo()
+        labels = dict(Request._fields['state'].selection)
+        requests = Request.search([('operator_id', '=', self.id),
+                                   ('state', 'in', ('collecting', 'brand') + IN_PROGRESS + ('review', 'feedback'))],
+                                  order='id desc', limit=3)
+        if not requests:
+            return _('No tengo nada en curso. Mandame fotos o videos con el texto.')
+        lines = []
+        for request in requests:
+            minutes = int((fields.Datetime.now() - request.write_date).total_seconds() // 60)
+            lines.append(_('• %(name)s: %(state)s (hace %(min)d min)') % {
+                'name': request.name, 'state': labels[request.state].lower(), 'min': minutes})
+        return '\n'.join(lines)
 
     def _handle_button(self, msg_uid, button_id):
         Message = self.env['auto.content.message'].sudo()
@@ -329,10 +379,13 @@ class AutoContentOperator(models.Model):
         if not brand:
             brands = self.env['auto.content.brand'].sudo().search([('company_id', '=', self.company_id.id)])
             brand = brands if len(brands) == 1 else brand
-        return Request.create({
+        request = Request.create({
             'operator_id': self.id,
             'brand_id': brand.id if brand else False,
             'company_id': self.company_id.id,
             'state': 'collecting',
             'process_after': fields.Datetime.now() + timedelta(seconds=self.debounce_seconds),
         })
+        self._notify(_('📥 Recibiendo %s. Mandá todo lo que quieras sumar; cuando termines escribí *listo* '
+                       '(si no, arranco solo cuando pasen unos minutos sin mensajes).') % request.name)
+        return request

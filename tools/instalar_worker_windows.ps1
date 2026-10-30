@@ -20,7 +20,7 @@ if (-not (Test-Path $env_file)) {
     $key  = Read-Host 'API key de Odoo (Preferencias > Seguridad de la cuenta)'
     @(
         "AC_ODOO_URL=$url", "AC_ODOO_DB=$db", "AC_ODOO_USER=$user", "AC_ODOO_KEY=$key",
-        'AC_INTERVAL=30', "AC_CLAUDE=$claude", "AC_LOG=$(Join-Path $aqui 'claude_worker.log')"
+        'AC_INTERVAL=10', "AC_CLAUDE=$claude", "AC_LOG=$(Join-Path $aqui 'claude_worker.log')"
     ) | Set-Content -Encoding UTF8 $env_file
     Write-Host "Configuración guardada en $env_file"
 }
