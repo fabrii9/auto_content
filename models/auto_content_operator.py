@@ -267,7 +267,8 @@ class AutoContentOperator(models.Model):
             in_review._add_inbound(msg_uid, 'text', body=body, counts_as_material=False)
             in_review._discard()
             return
-        if low in RETRY_WORDS:
+        words = low.split()
+        if words and words[0] in RETRY_WORDS and len(words) <= 4:
             failed = Request.search([('operator_id', '=', self.id), ('state', '=', 'error')], limit=1)
             Message.create({'msg_uid': msg_uid, 'operator_id': self.id, 'kind': 'text', 'body': body})
             if failed:

@@ -17,7 +17,7 @@ from odoo.exceptions import AccessError, UserError
 from odoo.addons.whatsapp.tools.whatsapp_api import WhatsAppApi
 
 from ..services import planner, renderer, video_edit
-from ..services.whatsapp_out import MAX_DOCUMENT_BYTES, MAX_IMAGE_BYTES, MAX_VIDEO_BYTES
+from ..services.whatsapp_out import MAX_IMAGE_BYTES, MAX_VIDEO_BYTES
 
 _logger = logging.getLogger(__name__)
 
@@ -549,7 +549,17 @@ class AutoContentRequest(models.Model):
             attachment_ids=[version.output_attachment_id.copy({'res_model': self._name, 'res_id': self.id}).id],
         )
         if self.operator_id:
-            version._send_proposal()
+            # Si WhatsApp rechaza un envío, la versión ya armada no se pierde:
+            # queda para revisar en Odoo y se le avisa al operador.
+            try:
+                with self.env.cr.savepoint():
+                    version._send_proposal()
+            except Exception as exc:
+                _logger.exception('auto_content: no pude mandar la propuesta de %s.', self.name)
+                self.message_post(body=_('No se pudo mandar la propuesta por WhatsApp: %s') % exc)
+                self.operator_id._notify(_(
+                    '%(name)s quedó armada, pero WhatsApp no aceptó un envío (%(error)s). '
+                    'La podés ver en Odoo.') % {'name': self.name, 'error': str(exc)[:200]})
         return version
 
     def _render(self, plan, media, workdir):
@@ -797,8 +807,11 @@ class AutoContentVersion(models.Model):
             light = attachment if size <= MAX_VIDEO_BYTES else self.preview_attachment_id
             if light:
                 uids.append(sender.media(light, 'video', caption=caption))
-            if size <= MAX_DOCUMENT_BYTES and (light != attachment or self.script):
-                uids.append(sender.media(attachment, 'document', caption=_('%s en calidad original') % caption))
+            if light != attachment:
+                # WhatsApp no acepta videos de más de 16 MB ni como documento:
+                # el original va como link de descarga.
+                uids.append(sender.text(_('%(caption)s en calidad original (%(mb).0f MB):\n%(url)s') % {
+                    'caption': caption, 'mb': size / 1024 / 1024, 'url': self._download_url()}))
         else:
             if size <= MAX_IMAGE_BYTES:
                 uids.append(sender.media(attachment, 'image', caption=caption))
@@ -812,6 +825,12 @@ class AutoContentVersion(models.Model):
             ('ac:discard:%d' % self.id, _('Descartar')),
         ]))
         self.wa_msg_uids = ' '.join(uid for uid in uids if uid)
+
+    def _download_url(self):
+        self.ensure_one()
+        attachment = self.output_attachment_id.sudo()
+        token = attachment.access_token or attachment.generate_access_token()[0]
+        return '%s/web/content/%d?access_token=%s&download=true' % (attachment.get_base_url(), attachment.id, token)
 
     def _approve(self):
         for version in self:
