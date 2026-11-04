@@ -36,21 +36,13 @@ class WhatsAppSender:
             vals['filename'] = filename or attachment.name
         return self.api._send_whatsapp(self.number, kind, vals)
 
-    def buttons(self, body, buttons):
-        """``buttons`` es una lista de hasta 3 tuplas ``(id, título)``."""
+    def _interactive(self, interactive):
         data = {
             'messaging_product': 'whatsapp',
             'recipient_type': 'individual',
             'to': self.number,
             'type': 'interactive',
-            'interactive': {
-                'type': 'button',
-                'body': {'text': body[:MAX_BODY]},
-                'action': {'buttons': [
-                    {'type': 'reply', 'reply': {'id': button_id[:256], 'title': title[:MAX_BUTTON_TITLE]}}
-                    for button_id, title in buttons[:3]
-                ]},
-            },
+            'interactive': interactive,
         }
         response = self.api._WhatsAppApi__api_requests(
             'POST', '/%s/messages' % self.api.phone_uid, auth_type='bearer',
@@ -60,3 +52,28 @@ class WhatsAppSender:
         if response_json.get('messages'):
             return response_json['messages'][0]['id']
         raise WhatsAppError(*self.api._prepare_error_response(response_json))
+
+    def options(self, body, button, rows):
+        """Lista desplegable (hasta 10 opciones). ``rows``: tuplas ``(id, título, descripción)``."""
+        return self._interactive({
+            'type': 'list',
+            'body': {'text': body[:MAX_BODY]},
+            'action': {
+                'button': button[:MAX_BUTTON_TITLE],
+                'sections': [{'rows': [
+                    {'id': row_id[:200], 'title': title[:24], 'description': (description or '')[:72]}
+                    for row_id, title, description in rows[:10]
+                ]}],
+            },
+        })
+
+    def buttons(self, body, buttons):
+        """``buttons`` es una lista de hasta 3 tuplas ``(id, título)``."""
+        return self._interactive({
+            'type': 'button',
+            'body': {'text': body[:MAX_BODY]},
+            'action': {'buttons': [
+                {'type': 'reply', 'reply': {'id': button_id[:256], 'title': title[:MAX_BUTTON_TITLE]}}
+                for button_id, title in buttons[:3]
+            ]},
+        })

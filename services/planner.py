@@ -51,7 +51,7 @@ Series: si el material da para más de una historia (dos trabajos distintos, un 
 
 MONTAGE_PROMPT = """
 # Montaje de video
-Esta vez llegaron videos: armá UN video editado para historia de Instagram (vertical, {ancho}×{alto}) con las mejores partes del material. No editás vos: escribís el guion y el sistema lo arma.
+Esta vez hay que armar UN video editado para historia de Instagram (vertical, {ancho}×{alto}) con las mejores partes del material. No editás vos: escribís el guion y el sistema lo arma.
 
 Cómo ves los videos: por cada video recibís una o más hojas de contacto (cuadros repartidos en todo el video, con su segundo escrito arriba a la izquierda), los segundos donde cambia la toma y, si se pudo, lo que se dice con sus tiempos. Usá esos segundos para elegir "desde" y "hasta".
 
@@ -389,7 +389,7 @@ def _parse_piece(design, index, data, designs, media, label='El plan'):
     return design, index, data
 
 
-def parse_plan(text, designs, media, montage=None):
+def parse_plan(text, designs, media, montage=None, content_format=None):
     """Valida y normaliza el plan. ``media`` como en ``build_user_prompt``.
 
     Con ``montage`` (ver ``parse_montage``) el plan tiene que traer el guion
@@ -436,6 +436,21 @@ def parse_plan(text, designs, media, montage=None):
     }
     if edit:
         result['montaje'] = edit
-    if series:
+    if series and content_format not in ('story', 'collage', 'before_after', 'card'):
         result['serie'] = series
+    _check_format(result, designs, content_format)
     return result
+
+
+def _check_format(plan, designs, content_format):
+    """Que el plan respete el formato que eligió el operador."""
+    mode = designs[plan['diseno']].get('media', 'no')
+    if content_format in ('collage', 'before_after') and mode != 'varias':
+        raise PlanError('El operador pidió %s: usá un diseño de varias fotos.' % (
+            'un collage' if content_format == 'collage' else 'un antes y después'))
+    if content_format == 'series' and not plan.get('serie'):
+        raise PlanError('El operador pidió una serie: sumá 1 o 2 historias en "serie".')
+    if content_format == 'card' and mode != 'no':
+        raise PlanError('El operador pidió una placa con texto: usá un diseño sin foto.')
+    if content_format == 'video' and not plan.get('montaje'):
+        raise PlanError('El operador pidió un video: devolvé el "montaje".')

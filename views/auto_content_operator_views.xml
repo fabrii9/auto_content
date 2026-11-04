@@ -33,6 +33,7 @@
                             <field name="phone" placeholder="+54 9 3777 64-1061"/>
                             <field name="wa_account_id"/>
                             <field name="brand_id"/>
+                            <field name="ask_format"/>
                             <field name="active" invisible="1"/>
                         </group>
                         <group>

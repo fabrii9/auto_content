@@ -53,6 +53,10 @@ class AutoContentOperator(models.Model):
         string='Espera para juntar (s)', default=90,
         help='Segundos sin mensajes nuevos antes de armar la pieza con todo lo recibido.',
     )
+    ask_format = fields.Boolean(
+        string='Preguntar el formato', default=True,
+        help='Al terminar de recibir el material, pregunta por WhatsApp qué armar (historia, collage, serie, video...).',
+    )
     last_inbound_at = fields.Datetime(string='Último mensaje', readonly=True)
 
     _phone_unique = models.Constraint(
@@ -187,7 +191,8 @@ class AutoContentOperator(models.Model):
         message_type = item.get('type')
 
         if message_type == 'interactive':
-            reply = (item.get('interactive') or {}).get('button_reply') or {}
+            interactive = item.get('interactive') or {}
+            reply = interactive.get('button_reply') or interactive.get('list_reply') or {}
             return self._handle_button(msg_uid, reply.get('id') or '')
         if message_type == 'button':
             return self._handle_button(msg_uid, (item.get('button') or {}).get('payload') or '')
@@ -251,6 +256,16 @@ class AutoContentOperator(models.Model):
             return
 
         collecting = Request.search([('operator_id', '=', self.id), ('state', '=', 'collecting')], limit=1)
+        choosing = Request.search([('operator_id', '=', self.id), ('state', '=', 'format')], limit=1)
+        if choosing and not collecting and low in START_WORDS:
+            Message.create({'msg_uid': msg_uid, 'operator_id': self.id, 'kind': 'text', 'body': body})
+            choosing._choose_format('auto')
+            return
+        if choosing and not collecting:
+            # Mientras elige el formato, un texto es una aclaración del pedido.
+            choosing._add_inbound(msg_uid, 'text', body=body)
+            self._notify(_('Lo sumo a %s. Elegí el formato en la lista de arriba.') % choosing.name)
+            return
         if collecting and low in START_WORDS:
             Message.create({'msg_uid': msg_uid, 'operator_id': self.id, 'kind': 'text', 'body': body})
             collecting.process_after = fields.Datetime.now()
@@ -321,7 +336,8 @@ class AutoContentOperator(models.Model):
         Request = self.env['auto.content.request'].sudo()
         labels = dict(Request._fields['state'].selection)
         requests = Request.search([('operator_id', '=', self.id),
-                                   ('state', 'in', ('collecting', 'brand') + IN_PROGRESS + ('review', 'feedback'))],
+                                   ('state', 'in', ('collecting', 'brand', 'format') + IN_PROGRESS
+                                    + ('review', 'feedback'))],
                                   order='id desc', limit=3)
         if not requests:
             return _('No tengo nada en curso. Mandame fotos o videos con el texto.')
@@ -350,6 +366,16 @@ class AutoContentOperator(models.Model):
                 self._notify(_('Marca activa: %s. Armo %s.') % (brand.name, request.name))
             return
 
+        if action == 'fmt' and len(parts) == 4:
+            request = self.env['auto.content.request'].sudo().browse(int(parts[2])).exists()
+            Message.create({'msg_uid': msg_uid, 'operator_id': self.id, 'kind': 'button', 'body': button_id,
+                            'request_id': request.id if request else False})
+            if request and request.operator_id == self and request.state == 'format':
+                request._choose_format(parts[3])
+            elif request:
+                self._notify(_('%s ya está en marcha; para cambiar el formato pedilo con "Cambiar".') % request.name)
+            return
+
         version = self.env['auto.content.version'].sudo().browse(int(parts[2])).exists()
         request = version.request_id
         Message.create({'msg_uid': msg_uid, 'operator_id': self.id, 'kind': 'button', 'body': button_id,
@@ -372,8 +398,12 @@ class AutoContentOperator(models.Model):
         """La solicitud abierta del operador, o una nueva."""
         self.ensure_one()
         Request = self.env['auto.content.request'].sudo()
-        request = Request.search([('operator_id', '=', self.id), ('state', '=', 'collecting')], limit=1)
+        request = Request.search([('operator_id', '=', self.id), ('state', 'in', ('collecting', 'format'))],
+                                 order='id desc', limit=1)
         if request:
+            if request.state == 'format':
+                # Mandó más material mientras le preguntábamos el formato: se suma y se vuelve a preguntar.
+                request.state = 'collecting'
             return request
         brand = self.brand_id
         if not brand:

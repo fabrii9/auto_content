@@ -69,6 +69,7 @@
                     <group>
                         <group>
                             <field name="brand_id" readonly="state not in ('collecting', 'brand', 'error')"/>
+                            <field name="content_format"/>
                             <field name="operator_id"/>
                             <field name="company_id" groups="base.group_multi_company"/>
                         </group>

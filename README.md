@@ -20,6 +20,17 @@ Es un módulo aparte y para varios clientes: depende de `mail`, `whatsapp` y `ll
    Con **Cambiar**, el siguiente texto es el pedido de cambio y se arma una versión nueva. También funciona respondiendo (citando) la propuesta.
 5. **Aprobar** deja la versión lista para publicar. La publicación en Instagram es la etapa 2.
 
+**Formato.** Al cerrar la recepción, Odoo le manda al operador una lista con los formatos que tienen sentido para el material:
+- Que elija la IA
+- Una historia
+- Collage
+- Serie de historias
+- Antes y después
+- Video editado
+- Placa con texto
+
+La IA tiene que respetar el formato elegido, y Odoo lo valida. Si en 10 minutos no elige, decide la IA. "listo" durante la pregunta es "que elija la IA". La pregunta se apaga por operador con *Preguntar el formato*.
+
 **Comandos por WhatsApp:**
 - `#codigo`: cambia la marca activa (por ejemplo, `#capsic`).
 - `ayuda`: muestra la ayuda.

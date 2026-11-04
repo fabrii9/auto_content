@@ -26,10 +26,30 @@ MAX_MEDIA_FOR_AI = 6
 MAX_IMAGES_MONTAGE = 12
 MAX_PHOTOS_MONTAGE = 4
 VIDEO_DEBOUNCE = 120
+FORMAT_WAIT = timedelta(minutes=10)
+# Formatos que se ofrecen por WhatsApp: (código, título, descripción, instrucción para la IA).
+CONTENT_FORMATS = [
+    ('auto', 'Que elija la IA', 'Arma lo que mejor quede con el material', None),
+    ('story', 'Una historia', 'Una sola pieza con la mejor foto o video',
+     'Armá UNA sola historia: no uses "serie".'),
+    ('collage', 'Collage', '2 o 3 fotos en la misma historia',
+     'Armá una historia con un diseño de varias fotos (collage), eligiendo las 2 o 3 mejores. Sin "serie".'),
+    ('series', 'Serie de historias', '2 o 3 historias para publicar seguidas',
+     'Armá una serie: la historia principal y 1 o 2 más en "serie" (2 o 3 en total), con diseños distintos '
+     'y sin repetir información entre ellas.'),
+    ('before_after', 'Antes y después', 'Dos fotos comparadas en una historia',
+     'Armá un antes y después: un diseño de varias fotos con 2 fotos, la primera es el antes y la segunda el '
+     'después, con pies que empiecen con "Antes" y "Después". Si no se distingue cuál es cuál, avisalo en "alertas".'),
+    ('video', 'Video editado', 'Un video con las mejores partes y música',
+     'Armá un video (montaje) con el material.'),
+    ('card', 'Placa con texto', 'Un aviso o un dato, sin foto',
+     'Armá una placa sin foto: un diseño que no use foto ni video, con los datos del texto.'),
+]
 STALE_PROCESSING = timedelta(minutes=20)
 REQUEST_STATES = [
     ('collecting', 'Recibiendo'),
     ('brand', 'Esperando marca'),
+    ('format', 'Eligiendo formato'),
     ('queued', 'En cola'),
     ('waiting_ai', 'Esperando IA'),
     ('processing', 'Armando'),
@@ -68,6 +88,11 @@ class AutoContentRequest(models.Model):
                                 help='Duración, cambios de toma y hojas de contacto de cada video (se calcula una vez).')
     transcript_json = fields.Text(string='Transcripción', readonly=True, copy=False,
                                   help='Lo que se dice en los videos, con tiempos (la hace el worker con Whisper).')
+    content_format = fields.Selection(
+        [(code, title) for code, title, _description, _prompt in CONTENT_FORMATS],
+        string='Formato', default='auto', tracking=True,
+        help='Lo que eligió el operador por WhatsApp (o "Que elija la IA").',
+    )
     pending_answer = fields.Text(string='Plan por armar', readonly=True, copy=False)
     pending_worker = fields.Char(string='Worker del plan', readonly=True, copy=False)
 
@@ -170,6 +195,9 @@ class AutoContentRequest(models.Model):
 
         for request in self.search([('state', '=', 'collecting'), ('process_after', '<=', now)]):
             request._close_collection()
+        for request in self.search([('state', '=', 'format'), ('process_after', '<=', now)]):
+            # No eligió formato a tiempo: decide la IA.
+            request._choose_format('auto', silent_timeout=True)
         Cron._commit_progress()
 
         queued = self.search([('state', '=', 'queued')], order='id', limit=5)
@@ -187,10 +215,78 @@ class AutoContentRequest(models.Model):
             return
         brand = self.brand_id or self.operator_id.brand_id
         if brand:
-            self.write({'brand_id': brand.id, 'state': 'queued'})
+            self.brand_id = brand
+            if not self._ask_format():
+                self.state = 'queued'
             return
         self.state = 'brand'
         self._ask_brand()
+
+    def _format_options(self):
+        """Los formatos que tienen sentido para el material recibido."""
+        self.ensure_one()
+        _texts, media = self._material()
+        photos = len([m for m in media if m['kind'] == 'image'])
+        videos = len(media) - photos
+        video_ready = bool(self.brand_id._video_config())
+        available = {
+            'auto': True,
+            'story': bool(media),
+            'collage': photos >= 2,
+            'series': len(media) >= 2,
+            'before_after': photos >= 2,
+            'video': video_ready and (videos >= 1 or photos >= 2),
+            'card': True,
+        }
+        return [f for f in CONTENT_FORMATS if available[f[0]]]
+
+    def _ask_format(self):
+        """Le pregunta al operador qué armar. ``False`` si no hace falta preguntar."""
+        self.ensure_one()
+        operator = self.operator_id
+        if not operator or not operator.ask_format or self.content_format != 'auto':
+            return False
+        options = self._format_options()
+        if len(options) <= 2:
+            return False
+        _texts, media = self._material()
+        photos = len([m for m in media if m['kind'] == 'image'])
+        parts = []
+        if photos:
+            parts.append(_('%d foto(s)') % photos)
+        if len(media) - photos:
+            parts.append(_('%d video(s)') % (len(media) - photos))
+        try:
+            operator._sender().options(
+                _('Tengo %(what)s para %(name)s. ¿Qué armo?') % {
+                    'what': _(' y ').join(parts) or _('el texto'), 'name': self.name},
+                _('Elegir formato'),
+                [('ac:fmt:%d:%s' % (self.id, code), title, description)
+                 for code, title, description, _prompt in options],
+            )
+        except Exception:
+            _logger.exception('auto_content: no pude preguntar el formato de %s.', self.name)
+            return False
+        self.write({'state': 'format', 'process_after': fields.Datetime.now() + FORMAT_WAIT})
+        self._trigger_cron(self.process_after)
+        return True
+
+    def _choose_format(self, code, silent_timeout=False):
+        self.ensure_one()
+        formats = {f[0]: f for f in CONTENT_FORMATS}
+        code = code if code in formats else 'auto'
+        self.write({'content_format': code, 'state': 'queued'})
+        self._trigger_cron()
+        if self.operator_id:
+            if silent_timeout:
+                self.operator_id._notify(_('No elegiste formato para %s: lo decide la IA.') % self.name)
+            else:
+                self.operator_id._notify(_('Dale: %(format)s. Armo %(name)s…') % {
+                    'format': formats[code][1].lower(), 'name': self.name})
+
+    def _format_prompt(self):
+        prompt = next((f[3] for f in CONTENT_FORMATS if f[0] == self.content_format), None)
+        return ('## Formato que pidió el operador\n' + prompt) if prompt else None
 
     def _ask_brand(self):
         self.ensure_one()
@@ -264,7 +360,11 @@ class AutoContentRequest(models.Model):
     def _is_montage(self, media):
         """Con videos y una marca con sección "video", se edita un montaje."""
         self.ensure_one()
-        return bool(self.brand_id._video_config()) and any(m['kind'] == 'video' for m in media)
+        if not self.brand_id._video_config():
+            return False
+        if self.content_format == 'video':
+            return True
+        return self.content_format == 'auto' and any(m['kind'] == 'video' for m in media)
 
     def _video_analysis(self, media, workdir):
         """Analiza cada video una sola vez (duración, cambios de toma y hojas de
@@ -509,10 +609,13 @@ class AutoContentRequest(models.Model):
                 else:
                     _texts, _media, images = self._prepare_media(workdir)
                     ai_media, extra = self._ai_media(media)[:len(images)], None
-                plan = brand._ai_plan(texts, ai_media, images, self._previous_plan(), instruction, extra, montage)
+                extra = '\n\n'.join(t for t in (extra, self._format_prompt()) if t) or None
+                plan = brand._ai_plan(texts, ai_media, images, self._previous_plan(), instruction, extra, montage,
+                                      self.content_format)
                 model = brand.llm_model
             else:
-                plan = planner.parse_plan(answer, brand._designs(), self._ai_media(media), montage)
+                plan = planner.parse_plan(answer, brand._designs(), self._ai_media(media), montage,
+                                          self.content_format)
                 model = 'Claude Code · %s' % (worker or brand.claude_model or '')
             output, kind, extras = self._render(plan, media, workdir)
         finally:
@@ -650,6 +753,7 @@ class AutoContentRequest(models.Model):
                     ai_media = request._ai_media(media)[:len(images)]
             finally:
                 shutil.rmtree(workdir, ignore_errors=True)
+            extra = '\n\n'.join(t for t in (extra, request._format_prompt()) if t) or None
             system_text, user_text = brand._prompts(
                 texts, ai_media, request._previous_plan(), request.pending_instruction, extra, montage,
             )
@@ -698,7 +802,8 @@ class AutoContentRequest(models.Model):
         _texts, media = request._material()
         montage = request._montage_context(media) if request._is_montage(media) else None
         try:
-            plan = planner.parse_plan(answer, request.brand_id._designs(), request._ai_media(media), montage)
+            plan = planner.parse_plan(answer, request.brand_id._designs(), request._ai_media(media), montage,
+                                      request.content_format)
         except planner.PlanError as exc:
             return {'ok': False, 'retry': True, 'error': str(exc)}
         if montage:
