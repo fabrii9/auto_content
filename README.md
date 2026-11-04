@@ -80,6 +80,21 @@ Sección `video` de `marca.json`:
 - Con videos, la espera para juntar material es de al menos 180 s.
 - Para que los videos lleguen sin compresión, conviene mandarlos **como documento**.
 
+## Modo de IA: Claude Code en el servidor (recomendado)
+
+La tarea automática ejecuta Claude Code **dentro del contenedor de Odoo**, con tu suscripción y sin PCs externas. Se instala en la imagen con el instalador oficial (ver `tools/Dockerfile.odooafm`). Para ponerlo en marcha:
+
+1. En tu PC, corré `claude setup-token` y copiá el token (empieza con `sk-ant-`).
+2. En el servidor, guardalo en `/home/clientes/odooafm/claude.env` (solo root, permisos 600) con esta línea:
+   ```
+   CLAUDE_CODE_OAUTH_TOKEN=sk-ant-...
+   ```
+   El compose lo carga con `env_file`.
+3. Aplicá el cambio con `docker compose up -d --force-recreate`. Un `restart` no vuelve a leer el archivo.
+4. En la marca, elegí *Claude Code en el servidor* y pulsá **Probar Claude en el servidor**.
+
+Primero se pide el plan y en otra pasada se arma la pieza, así cada paso tiene su propio límite de tiempo. En este modo no hay transcripción (Whisper), así que los montajes salen sin subtítulos.
+
 ## Modo de IA: Claude Code (sin API)
 
 Cada marca elige su modo de IA:
