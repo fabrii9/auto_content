@@ -543,6 +543,14 @@ class AutoContentRequest(models.Model):
             'res_model': version._name,
             'res_id': version.id,
         })
+        for position, raw in enumerate(extras.get('serie') or [], 2):
+            version.extra_attachment_ids = [(4, self.env['ir.attachment'].sudo().create({
+                'name': '%s-%s-v%d-historia%d.png' % (brand.code, self.name.replace('/', ''), number, position),
+                'raw': raw,
+                'mimetype': 'image/png',
+                'res_model': version._name,
+                'res_id': version.id,
+            }).id)]
         if extras.get('preview'):
             version.preview_attachment_id = self.env['ir.attachment'].sudo().create({
                 'name': '%s-%s-v%d-vista.mp4' % (brand.code, self.name.replace('/', ''), number),
@@ -575,10 +583,22 @@ class AutoContentRequest(models.Model):
         """Devuelve ``(bytes, 'image'|'video', extras)``."""
         if plan.get('montaje'):
             return self._render_montage(plan, media, workdir)
+        output, kind = self._render_piece(plan, media, workdir, 'pieza')
+        series = [self._render_piece(piece, media, workdir, 'pieza-%d' % number)[0]
+                  for number, piece in enumerate(plan.get('serie') or [], 2)]
+        return output, kind, {'serie': series}
+
+    def _render_piece(self, plan, media, workdir, name):
+        """Una historia: ``(bytes, 'image'|'video')``."""
         brand = self.brand_id
         template = brand._pack_dir() / brand.template_path
         chrome = renderer.find_chrome(self._param('chrome_path'))
         data = dict(plan['datos'], plantilla=plan['diseno'])
+        if isinstance(plan['media'], list):
+            by_index = {m['index']: m for m in media}
+            data['fotos'] = [by_index[i]['path'].resolve().as_uri() for i in plan['media'] if i in by_index]
+            out = renderer.render_html(template, data, workdir / ('%s.png' % name), brand.width, brand.height, chrome)
+            return out.read_bytes(), 'image'
         chosen = next((m for m in media if m['index'] == plan['media']), None)
         if chosen and chosen['kind'] == 'video':
             ffmpeg = renderer.find_ffmpeg(self._param('ffmpeg_path'))
@@ -586,13 +606,13 @@ class AutoContentRequest(models.Model):
                 template, dict(data, foto='', transparente=True), workdir / 'capa.png',
                 brand.width, brand.height, chrome, transparent=True,
             )
-            out = renderer.compose_video(chosen['path'], overlay, workdir / 'pieza.mp4',
+            out = renderer.compose_video(chosen['path'], overlay, workdir / ('%s.mp4' % name),
                                          brand.width, brand.height, ffmpeg)
-            return out.read_bytes(), 'video', {}
+            return out.read_bytes(), 'video'
         if chosen:
             data['foto'] = chosen['path'].resolve().as_uri()
-        out = renderer.render_html(template, data, workdir / 'pieza.png', brand.width, brand.height, chrome)
-        return out.read_bytes(), 'image', {}
+        out = renderer.render_html(template, data, workdir / ('%s.png' % name), brand.width, brand.height, chrome)
+        return out.read_bytes(), 'image'
 
     def _param(self, key):
         return self.env['ir.config_parameter'].sudo().get_param('auto_content.%s' % key) or None
@@ -775,6 +795,9 @@ class AutoContentVersion(models.Model):
     preview_attachment_id = fields.Many2one('ir.attachment', string='Vista liviana', readonly=True,
                                             help='Video comprimido para mandarlo por WhatsApp (máximo 16 MB).')
     script = fields.Text(string='Guion del montaje')
+    extra_attachment_ids = fields.Many2many(
+        'ir.attachment', 'auto_content_version_serie_rel', 'version_id', 'attachment_id',
+        string='Otras historias de la serie', readonly=True)
     preview = fields.Binary(compute='_compute_preview', string='Vista previa')
     llm_model = fields.Char(string='Modelo')
     duration = fields.Float(string='Duración (s)', digits=(10, 1))
@@ -799,6 +822,8 @@ class AutoContentVersion(models.Model):
             lines += ['', self.summary]
         if self.alerts:
             lines += ['', _('⚠️ Revisá:')] + ['• %s' % a for a in self.alerts.splitlines()]
+        if self.extra_attachment_ids:
+            lines.append(_('Serie de %d historias para publicar seguidas.') % (1 + len(self.extra_attachment_ids)))
         if self.script:
             lines += ['', self.script]
         if self.sticker:
@@ -824,9 +849,13 @@ class AutoContentVersion(models.Model):
                 uids.append(sender.text(_('%(caption)s en calidad original (%(mb).0f MB):\n%(url)s') % {
                     'caption': caption, 'mb': size / 1024 / 1024, 'url': self._download_url()}))
         else:
-            if size <= MAX_IMAGE_BYTES:
-                uids.append(sender.media(attachment, 'image', caption=caption))
-            uids.append(sender.media(attachment, 'document', caption=_('%s en calidad original') % caption))
+            pieces = attachment | self.extra_attachment_ids
+            for number, piece in enumerate(pieces, 1):
+                label = caption if len(pieces) == 1 else _('%(caption)s · historia %(n)d de %(total)d') % {
+                    'caption': caption, 'n': number, 'total': len(pieces)}
+                if len(piece.raw or b'') <= MAX_IMAGE_BYTES:
+                    uids.append(sender.media(piece, 'image', caption=label))
+                uids.append(sender.media(piece, 'document', caption=_('%s en calidad original') % label))
         # El texto de un mensaje con botones admite 1024 caracteres: el detalle
         # va en un texto aparte (4096) y los botones con una pregunta corta.
         uids.append(sender.text(self._proposal_body()))

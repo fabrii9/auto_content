@@ -159,6 +159,7 @@
                             <field name="output_kind" readonly="1"/>
                             <field name="output_attachment_id"/>
                             <field name="preview_attachment_id" invisible="not preview_attachment_id"/>
+                            <field name="extra_attachment_ids" widget="many2many_binary" invisible="not extra_attachment_ids"/>
                         </group>
                         <group>
                             <field name="llm_model" readonly="1"/>

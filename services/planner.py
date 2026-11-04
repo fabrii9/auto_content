@@ -24,14 +24,17 @@ Reglas generales:
 - Respondé solo con un objeto JSON válido, sin texto antes ni después, con esta forma:
 {{
   "diseno": "<código de uno de los diseños disponibles>",
-  "media": <número del archivo elegido (1, 2, ...) o null si el diseño no usa archivo>,
+  "media": <número del archivo elegido (1, 2, ...), una lista de 2 o 3 números si el diseño usa varias fotos, o null si no usa archivo>,
   "datos": {{ <los campos del diseño, sin "foto"> }},
   "lugar": "<lugar oficial detectado o null>",
   "resumen": "<una o dos frases para el operador: qué armaste y por qué>",
   "alertas": ["<avisos para el operador>"],
   "sticker": "<sticker de Instagram sugerido para sumar al publicar, o null>",
-  "texto_publicacion": "<texto breve sugerido si se publica en el feed, o null>"
+  "texto_publicacion": "<texto breve sugerido si se publica en el feed, o null>",
+  "serie": [ {{"diseno": "...", "media": ..., "datos": {{...}}}} ]
 }}
+
+Series: si el material da para más de una historia (dos trabajos distintos, un antes y un después, varias fotos buenas que no entran en una), usá "serie" con hasta 2 historias más, que se publican seguidas después de la principal. Cada una tiene su "diseno", "media" y "datos", con las mismas reglas. Que cada historia se entienda sola y que juntas no repitan lo mismo; si alcanza con una, dejá "serie" vacía. Buscá variedad: combiná diseños (por ejemplo, un collage y una foto a sangre) en vez de repetir el mismo.
 
 # Diseños disponibles
 {disenos}
@@ -84,6 +87,7 @@ MEDIA_LABELS = {
     'requerida': 'necesita una foto o video',
     'opcional': 'puede llevar foto o video',
     'no': 'no usa foto ni video',
+    'varias': 'usa 2 o 3 fotos',
 }
 
 
@@ -344,6 +348,47 @@ def parse_montage(raw, designs, montage):
     }
 
 
+MAX_SERIES = 2
+
+
+def _parse_piece(design, index, data, designs, media, label='El plan'):
+    """Valida un diseño con su archivo (o archivos) y sus datos."""
+    if design not in designs:
+        raise PlanError('%s eligió un diseño que no existe: %r.' % (label, design))
+    mode = designs[design].get('media', 'no')
+    if mode == 'varias':
+        images = [item['index'] for item in media if item['kind'] == 'image']
+        chosen = []
+        for value in index if isinstance(index, list) else [index]:
+            value = _index(value)
+            if value in images and value not in chosen:
+                chosen.append(value)
+        chosen = chosen[:3]
+        if len(chosen) < 2:
+            if len(images) < 2:
+                raise PlanError('El diseño %s necesita 2 o 3 fotos y llegaron %d.' % (design, len(images)))
+            raise PlanError('%s: el diseño %s necesita en "media" una lista de 2 o 3 números de foto (fotos: %s).' % (
+                label, design, ', '.join(map(str, images))))
+        index = chosen
+    else:
+        if isinstance(index, list):
+            index = index[0] if index else None
+        index = _index(index)
+        if index not in {item['index'] for item in media}:
+            index = None
+        if mode == 'requerida' and index is None:
+            if not media:
+                raise PlanError('El diseño %s necesita una foto o video y no hay archivos.' % design)
+            index = media[0]['index']
+        if mode == 'no':
+            index = None
+    if not isinstance(data, dict):
+        raise PlanError('%s: faltan los "datos" del diseño.' % label)
+    for reserved in ('foto', 'fotos', 'transparente', 'plantilla'):
+        data.pop(reserved, None)
+    return design, index, data
+
+
 def parse_plan(text, designs, media, montage=None):
     """Valida y normaliza el plan. ``media`` como en ``build_user_prompt``.
 
@@ -359,26 +404,22 @@ def parse_plan(text, designs, media, montage=None):
     if edit and edit['capa'] != 'ninguna' and mode == 'no':
         raise PlanError('Para la capa sobre el video usá un diseño que lleve foto o video (o "capa": "ninguna").')
     if edit:
-        mode = 'no'
-
-    index = plan.get('media')
-    valid = {item['index'] for item in media}
-    if isinstance(index, str) and index.isdigit():
-        index = int(index)
-    if index not in valid:
+        data = plan.get('datos')
+        if not isinstance(data, dict):
+            raise PlanError('Faltan los "datos" del diseño.')
+        for reserved in ('foto', 'fotos', 'transparente', 'plantilla'):
+            data.pop(reserved, None)
         index = None
-    if mode == 'requerida' and index is None:
-        if not media:
-            raise PlanError('El diseño %s necesita una foto o video y no hay archivos.' % design)
-        index = media[0]['index']
-    if mode == 'no':
-        index = None
-
-    data = plan.get('datos')
-    if not isinstance(data, dict):
-        raise PlanError('Faltan los "datos" del diseño.')
-    for reserved in ('foto', 'transparente', 'plantilla'):
-        data.pop(reserved, None)
+    else:
+        design, index, data = _parse_piece(design, plan.get('media'), plan.get('datos'), designs, media)
+    series = []
+    if not edit:
+        for number, piece in enumerate((plan.get('serie') or [])[:MAX_SERIES], 2):
+            if not isinstance(piece, dict):
+                continue
+            series.append(dict(zip(('diseno', 'media', 'datos'), _parse_piece(
+                piece.get('diseno'), piece.get('media'), piece.get('datos'), designs, media,
+                label='La historia %d de la serie' % number))))
 
     alerts = plan.get('alertas') or []
     if isinstance(alerts, str):
@@ -395,4 +436,6 @@ def parse_plan(text, designs, media, montage=None):
     }
     if edit:
         result['montaje'] = edit
+    if series:
+        result['serie'] = series
     return result

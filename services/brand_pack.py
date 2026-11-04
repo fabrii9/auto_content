@@ -33,7 +33,7 @@ from .video_edit import TRANSITIONS
 
 MANIFEST = 'marca.json'
 MAX_PACK_BYTES = 60 * 1024 * 1024
-MEDIA_MODES = ('requerida', 'opcional', 'no')
+MEDIA_MODES = ('requerida', 'opcional', 'no', 'varias')
 
 
 class PackError(ValueError):
