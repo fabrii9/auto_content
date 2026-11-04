@@ -54,10 +54,13 @@ class AutoContentBrand(models.Model):
     place_ids = fields.One2many('auto.content.place', 'brand_id', string='Lugares')
 
     ai_mode = fields.Selection(
-        [('provider', 'Proveedor por API (LLM Connector)'), ('claude_code', 'Claude Code (worker del operador)')],
+        [('provider', 'Proveedor por API (LLM Connector)'),
+         ('claude_server', 'Claude Code en el servidor (suscripción)'),
+         ('claude_code', 'Claude Code (worker en otra PC)')],
         string='Modo de IA', required=True, default='provider', tracking=True,
-        help='Con Claude Code, las solicitudes esperan a que el worker (tools/claude_worker.py), '
-             'corriendo en una PC con Claude Code logueado, las tome y devuelva el plan.',
+        help='En el servidor: la tarea automática ejecuta Claude Code dentro del contenedor de Odoo, con el '
+             'token de la suscripción (CLAUDE_CODE_OAUTH_TOKEN). Worker en otra PC: las solicitudes esperan a '
+             'que tools/claude_worker.py las tome.',
     )
     claude_model = fields.Char(
         string='Modelo de Claude Code', default='sonnet',
@@ -239,6 +242,24 @@ class AutoContentBrand(models.Model):
         request._add_inbound('test-%s' % uuid.uuid4().hex, 'image', attachment=attachment)
         request._run()
         return request._open_form()
+
+    def action_test_claude_server(self):
+        """Comprueba que Claude Code responde en el servidor con la suscripción."""
+        self.ensure_one()
+        import tempfile
+        from ..services import claude_cli
+        request = self.env['auto.content.request']
+        try:
+            claude = claude_cli.find_claude(request._param('claude_path'))
+            with tempfile.TemporaryDirectory(prefix='claude-prueba-') as workdir:
+                answer = claude_cli.run(claude, self.claude_model or 'sonnet', 'Respondé solo: OK', workdir,
+                                        request._claude_home(), timeout=120, max_turns=1)
+        except claude_cli.ClaudeError as exc:
+            raise UserError(_('Claude Code en el servidor no responde: %s') % exc) from exc
+        return {
+            'type': 'ir.actions.client', 'tag': 'display_notification',
+            'params': {'type': 'success', 'message': _('Claude Code respondió: %s') % (answer or '')[:200]},
+        }
 
     def action_view_requests(self):
         self.ensure_one()

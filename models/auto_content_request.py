@@ -14,9 +14,10 @@ from markupsafe import Markup
 
 from odoo import _, api, fields, models
 from odoo.exceptions import AccessError, UserError
+from odoo.tools import config
 from odoo.addons.whatsapp.tools.whatsapp_api import WhatsAppApi
 
-from ..services import planner, renderer, video_edit
+from ..services import claude_cli, planner, renderer, video_edit
 from ..services.whatsapp_out import MAX_IMAGE_BYTES, MAX_VIDEO_BYTES
 
 _logger = logging.getLogger(__name__)
@@ -594,6 +595,14 @@ class AutoContentRequest(models.Model):
         if answer is None and brand.ai_mode == 'claude_code':
             self.state = 'waiting_ai'
             return self.env['auto.content.version']
+        if answer is None and brand.ai_mode == 'claude_server':
+            # Primero el plan y, en otra pasada de la tarea, el armado: así cada
+            # paso tiene su propio límite de tiempo.
+            answer = self._claude_server_answer()
+            self.write({'pending_answer': answer, 'pending_worker': 'servidor · %s' % (brand.claude_model or 'sonnet'),
+                        'state': 'queued'})
+            self._trigger_cron()
+            return self.env['auto.content.version']
 
         started = time.monotonic()
         workdir = Path(tempfile.mkdtemp(prefix='auto-content-'))
@@ -716,6 +725,49 @@ class AutoContentRequest(models.Model):
             data['foto'] = chosen['path'].resolve().as_uri()
         out = renderer.render_html(template, data, workdir / ('%s.png' % name), brand.width, brand.height, chrome)
         return out.read_bytes(), 'image'
+
+    def _claude_home(self):
+        """HOME de Claude Code en el servidor (su configuración, no la sesión)."""
+        return Path(config['data_dir']) / 'claude-auto-content'
+
+    def _claude_server_answer(self):
+        """Pide el plan a Claude Code en el servidor, con los mismos prompts que el
+        worker. Si el JSON no sirve, se lo devuelve una vez para que lo corrija."""
+        self.ensure_one()
+        brand = self.brand_id
+        claude = claude_cli.find_claude(self._param('claude_path'))
+        workdir = Path(tempfile.mkdtemp(prefix='auto-content-claude-'))
+        try:
+            texts, media = self._write_media(workdir)
+            montage = extra = None
+            if self._is_montage(media):
+                analysis = self._video_analysis(media, workdir)
+                montage = self._montage_context(media, analysis)
+                images, ai_media, extra = self._montage_inputs(media, analysis)
+            else:
+                _texts, _media, images = self._prepare_media(workdir)
+                ai_media = self._ai_media(media)[:len(images)]
+            extra = '\n\n'.join(t for t in (extra, self._format_prompt()) if t) or None
+            system_text, user_text = brand._prompts(
+                texts, ai_media, self._previous_plan(), self.pending_instruction, extra, montage)
+            names = []
+            for number, image in enumerate(images, 1):
+                name = 'imagen-%d.jpg' % number
+                (workdir / name).write_bytes(image)
+                names.append(name)
+            prompt = claude_cli.build_prompt(system_text, user_text, names)
+            for attempt in (1, 2):
+                answer = claude_cli.run(claude, brand.claude_model or 'sonnet', prompt, workdir, self._claude_home())
+                try:
+                    planner.parse_plan(answer, brand._designs(), self._ai_media(media), montage, self.content_format)
+                    return answer
+                except planner.PlanError as exc:
+                    if attempt == 2:
+                        raise
+                    _logger.warning('auto_content: plan inválido de Claude en el servidor (%s), reintento.', exc)
+                    prompt += '\n\nTu respuesta anterior no sirve: %s\nVolvé a responder solo con el JSON pedido.' % exc
+        finally:
+            shutil.rmtree(workdir, ignore_errors=True)
 
     def _param(self, key):
         return self.env['ir.config_parameter'].sudo().get_param('auto_content.%s' % key) or None

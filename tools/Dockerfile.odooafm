@@ -16,5 +16,15 @@ RUN apt-get update \
  && rm -f /tmp/chrome.deb \
  && rm -rf /var/lib/apt/lists/*
 
+# Claude Code oficial (instalador nativo, binario autocontenido) para el modo de IA
+# "Claude Code en el servidor". La sesión llega por CLAUDE_CODE_OAUTH_TOKEN (claude.env),
+# no queda en la imagen.
+RUN curl -fsSL https://claude.ai/install.sh | bash \
+ && cp -L /root/.local/bin/claude /usr/local/bin/claude \
+ && chmod 755 /usr/local/bin/claude \
+ && rm -rf /root/.local/share/claude /root/.local/bin/claude \
+ && /usr/local/bin/claude --version
+ENV DISABLE_AUTOUPDATER=1
+
 USER odoo
 CMD ["/usr/bin/python3", "/mnt/odoo/odoo-bin", "--config=/etc/odoo/odoo.conf"]
