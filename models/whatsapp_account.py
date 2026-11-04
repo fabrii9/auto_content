@@ -22,8 +22,16 @@ class WhatsappAccount(models.Model):
         if 'messages' not in data and data.get('whatsapp_business_api_data', {}).get('messages'):
             data = data['whatsapp_business_api_data']
         Operator = self.env['auto.content.operator'].sudo()
+        # Si está instalado "Consultas por WhatsApp", lo que es para ese bot no es material.
+        Consultas = self.env['wa.consultas.contact'].sudo() if 'wa.consultas.contact' in self.env else None
         pending = []
         for item in data.get('messages', []):
+            if Consultas is not None:
+                try:
+                    if Consultas._claim(self, item):
+                        continue
+                except Exception:
+                    _logger.exception('auto_content: no pude consultar el ruteo de Consultas por WhatsApp.')
             operator = Operator._match(self, item.get('from'))
             if operator:
                 pending.append((operator, item))

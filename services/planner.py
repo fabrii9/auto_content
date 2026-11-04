@@ -98,7 +98,10 @@ class PlanError(ValueError):
 def describe_designs(designs):
     lines = []
     for code, spec in designs.items():
-        line = '- `%s`: %s (%s).' % (code, spec.get('descripcion', ''), MEDIA_LABELS[spec.get('media', 'no')])
+        label = MEDIA_LABELS[spec.get('media', 'no')]
+        if spec.get('solo_fotos'):
+            label = 'necesita una foto; no sirve para video'
+        line = '- `%s`: %s (%s).' % (code, spec.get('descripcion', ''), label)
         if spec.get('campos'):
             line += ' Campos: %s' % spec['campos']
         lines.append(line)
@@ -165,6 +168,11 @@ def build_user_prompt(texts, media, previous_plan=None, instruction=None, extra=
         parts.append('\n## Cambio que pide el operador')
         parts.append(instruction or 'Hacé otra versión distinta de la anterior.')
         parts.append('Aplicá el cambio y mantené lo demás salvo que el pedido diga otra cosa.')
+        if previous_plan.get('media') is not None:
+            parts.append('La versión anterior usaba una foto o video: la nueva también, salvo que el pedido diga '
+                         'explícitamente que no lleve. Si pide otro estilo o diseño, cambiá a otro diseño con foto '
+                         'o a otro color, con la misma foto (o la que indique). No cambies el tema ni sumes datos que '
+                         'no estén en el material.')
     return '\n'.join(parts)
 
 
@@ -382,6 +390,11 @@ def _parse_piece(design, index, data, designs, media, label='El plan'):
             index = media[0]['index']
         if mode == 'no':
             index = None
+        if index is not None and designs[design].get('solo_fotos'):
+            kind = next((item['kind'] for item in media if item['index'] == index), 'image')
+            if kind == 'video':
+                raise PlanError('%s: el diseño %s es solo para fotos y el archivo %d es un video (usá foto).' % (
+                    label, design, index))
     if not isinstance(data, dict):
         raise PlanError('%s: faltan los "datos" del diseño.' % label)
     for reserved in ('foto', 'fotos', 'transparente', 'plantilla'):
@@ -389,7 +402,7 @@ def _parse_piece(design, index, data, designs, media, label='El plan'):
     return design, index, data
 
 
-def parse_plan(text, designs, media, montage=None, content_format=None):
+def parse_plan(text, designs, media, montage=None, content_format=None, keep_media=False):
     """Valida y normaliza el plan. ``media`` como en ``build_user_prompt``.
 
     Con ``montage`` (ver ``parse_montage``) el plan tiene que traer el guion
@@ -403,6 +416,8 @@ def parse_plan(text, designs, media, montage=None, content_format=None):
     edit = parse_montage(plan.get('montaje'), designs, montage) if montage else None
     if edit and edit['capa'] != 'ninguna' and mode == 'no':
         raise PlanError('Para la capa sobre el video usá un diseño que lleve foto o video (o "capa": "ninguna").')
+    if edit and edit['capa'] != 'ninguna' and designs[design].get('solo_fotos'):
+        raise PlanError('El diseño %s es solo para fotos: para la capa sobre el video usá foto.' % design)
     if edit:
         data = plan.get('datos')
         if not isinstance(data, dict):
@@ -439,6 +454,9 @@ def parse_plan(text, designs, media, montage=None, content_format=None):
     if series and content_format not in ('story', 'collage', 'before_after', 'card'):
         result['serie'] = series
     _check_format(result, designs, content_format)
+    if keep_media and not edit and designs[design].get('media', 'no') == 'no':
+        raise PlanError('La versión anterior llevaba foto y el operador no pidió sacarla: usá un diseño con foto '
+                        '(otra variante o color si pidió otro estilo).')
     return result
 
 

@@ -189,7 +189,7 @@ class AutoContentBrand(models.Model):
         return system_text, planner.build_user_prompt(texts, media, previous_plan, instruction, extra)
 
     def _ai_plan(self, texts, media, images, previous_plan=None, instruction=None, extra=None, montage=None,
-                 content_format=None):
+                 content_format=None, keep_media=False):
         """Pide el plan al proveedor por API. ``images`` son JPEG en el orden de ``media``."""
         self.ensure_one()
         provider = self.llm_provider_id.sudo()
@@ -206,7 +206,7 @@ class AutoContentBrand(models.Model):
             max_tokens=self.llm_max_tokens, **extra,
         )
         try:
-            return planner.parse_plan(answer, designs, media, montage, content_format)
+            return planner.parse_plan(answer, designs, media, montage, content_format, keep_media)
         except planner.PlanError as first_error:
             _logger.warning('auto_content: plan inválido (%s), reintento una vez.', first_error)
             messages += [
@@ -217,7 +217,7 @@ class AutoContentBrand(models.Model):
                 messages, model=self.llm_model or None, temperature=self.llm_temperature,
                 max_tokens=self.llm_max_tokens, **extra,
             )
-            return planner.parse_plan(answer, designs, media, montage, content_format)
+            return planner.parse_plan(answer, designs, media, montage, content_format, keep_media)
 
     def action_test(self):
         """Arma una pieza de prueba con la foto y el texto de prueba del paquete,

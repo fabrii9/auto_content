@@ -289,6 +289,10 @@ class AutoContentOperator(models.Model):
                 waiting_change = version.request_id
                 if waiting_change.current_version_id != version:
                     waiting_change.current_version_id = version
+            if not version:
+                quoted_change = self._quoted_material(quoted_uid, body)
+                if quoted_change is not None:
+                    waiting_change, body = quoted_change
         if waiting_change:
             waiting_change._add_inbound(msg_uid, 'text', body=body, counts_as_material=False)
             waiting_change._request_change(body)
@@ -331,6 +335,28 @@ class AutoContentOperator(models.Model):
         request._add_inbound(msg_uid, 'text', body=body)
         request._bump()
 
+    def _quoted_material(self, quoted_uid, body):
+        """Citó una foto o video que mandó él mismo.
+
+        Si su solicitud ya tiene una propuesta, es un pedido de cambio sobre esa
+        propuesta usando el archivo citado: ``(solicitud, instrucción)``. Si no,
+        ``None`` y el texto sigue su camino normal.
+        """
+        self.ensure_one()
+        quoted = self.env['auto.content.message'].sudo().search(
+            [('msg_uid', '=', quoted_uid), ('operator_id', '=', self.id)], limit=1)
+        request = quoted.request_id
+        if not quoted.attachment_id or not request or not request.current_version_id \
+                or request.state not in ('review', 'approved', 'discarded', 'feedback'):
+            return None
+        _texts, media = request._material()
+        number = next((m['index'] for m in media if m['attachment'] == quoted.attachment_id), None)
+        if number is None:
+            return None
+        label = 'el video' if quoted.kind == 'video' else 'la foto'
+        return request, _('%(body)s\n(El operador citó %(label)s número %(n)d: usá ese archivo en "media".)') % {
+            'body': body, 'label': label, 'n': number}
+
     def _status_text(self):
         self.ensure_one()
         Request = self.env['auto.content.request'].sudo()
@@ -352,13 +378,13 @@ class AutoContentOperator(models.Model):
         Message = self.env['auto.content.message'].sudo()
         parts = button_id.split(':')
         if len(parts) < 3 or parts[0] != 'ac':
-            Message.create({'msg_uid': msg_uid, 'operator_id': self.id, 'kind': 'button', 'body': button_id})
+            Message.create({'msg_uid': msg_uid, 'operator_id': self.id, 'kind': 'button', 'body': button_id, 'is_material': False})
             return
         action = parts[1]
         if action == 'brand' and len(parts) == 4:
             request = self.env['auto.content.request'].sudo().browse(int(parts[2])).exists()
             brand = self.env['auto.content.brand'].sudo().browse(int(parts[3])).exists()
-            Message.create({'msg_uid': msg_uid, 'operator_id': self.id, 'kind': 'button', 'body': button_id,
+            Message.create({'msg_uid': msg_uid, 'operator_id': self.id, 'kind': 'button', 'body': button_id, 'is_material': False,
                             'request_id': request.id if request else False})
             if request and brand and request.operator_id == self and request.state == 'brand':
                 self.brand_id = brand
@@ -368,7 +394,7 @@ class AutoContentOperator(models.Model):
 
         if action == 'fmt' and len(parts) == 4:
             request = self.env['auto.content.request'].sudo().browse(int(parts[2])).exists()
-            Message.create({'msg_uid': msg_uid, 'operator_id': self.id, 'kind': 'button', 'body': button_id,
+            Message.create({'msg_uid': msg_uid, 'operator_id': self.id, 'kind': 'button', 'body': button_id, 'is_material': False,
                             'request_id': request.id if request else False})
             if request and request.operator_id == self and request.state == 'format':
                 request._choose_format(parts[3])
@@ -378,7 +404,7 @@ class AutoContentOperator(models.Model):
 
         version = self.env['auto.content.version'].sudo().browse(int(parts[2])).exists()
         request = version.request_id
-        Message.create({'msg_uid': msg_uid, 'operator_id': self.id, 'kind': 'button', 'body': button_id,
+        Message.create({'msg_uid': msg_uid, 'operator_id': self.id, 'kind': 'button', 'body': button_id, 'is_material': False,
                         'request_id': request.id if request else False})
         if not version or request.operator_id != self:
             return

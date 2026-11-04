@@ -7,6 +7,10 @@ USER root
 COPY requirements.txt /tmp/requirements.txt
 RUN pip3 install --no-cache-dir --break-system-packages packaging -r /tmp/requirements.txt
 
+# Consultas por WhatsApp (wa_consultas): SDK de Claude API. Pip
+# no puede desinstalar paquetes de Debian: anthropic y sus dependencias van a /usr/local sin tocar los del sistema.
+RUN pip3 install --no-cache-dir --break-system-packages --ignore-installed anthropic
+
 # Contenido automatizado (auto_content): Chrome headless arma las piezas y ffmpeg los videos.
 # Chrome va desde el .deb oficial y no por pip, para no tocar greenlet/gevent de Odoo.
 RUN apt-get update \

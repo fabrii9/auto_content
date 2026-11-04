@@ -4,6 +4,7 @@ import base64
 import json
 import logging
 import mimetypes
+import re
 import shutil
 import tempfile
 import time
@@ -47,6 +48,13 @@ CONTENT_FORMATS = [
      'Armá una placa sin foto: un diseño que no use foto ni video, con los datos del texto.'),
 ]
 STALE_PROCESSING = timedelta(minutes=20)
+# Memoria de lo que ya se armó, para que la IA no repita diseño y color.
+HISTORY_DAYS = 4
+HISTORY_LIMIT = 8
+# Un pedido de cambio que pide sacar la foto.
+NO_MEDIA_WORDS = re.compile(r'sin (la |una )?(foto|imagen|video)|solo (con )?texto|placa (de texto|sin)', re.I)
+# Un texto que habla de una foto que no llegó ("con esta imagen").
+REFERS_MEDIA = re.compile(r'\b(esta|esa|la|aquella|otra) (imagen|foto|video)\b', re.I)
 REQUEST_STATES = [
     ('collecting', 'Recibiendo'),
     ('brand', 'Esperando marca'),
@@ -172,7 +180,8 @@ class AutoContentRequest(models.Model):
     def _material(self):
         """Textos y archivos del material, en orden de llegada."""
         self.ensure_one()
-        messages = self.inbound_ids.filtered('is_material').sorted('id')
+        # Los botones (ac:fmt:…, ac:change:…) son órdenes, no material.
+        messages = self.inbound_ids.filtered(lambda m: m.is_material and m.kind != 'button').sorted('id')
         texts = [m.body for m in messages if m.body]
         media = []
         for message in messages.filtered('attachment_id'):
@@ -213,6 +222,16 @@ class AutoContentRequest(models.Model):
         texts, media = self._material()
         if not media and not any(t.strip() for t in texts):
             self.state = 'discarded'
+            return
+        text = ' '.join(t.strip() for t in texts)
+        if not media and (len(text) < 30 or REFERS_MEDIA.search(text)):
+            # "No, con esta imagen" sin la imagen: no hay con qué armar una pieza.
+            self.state = 'discarded'
+            if self.operator_id:
+                self.operator_id._notify(_(
+                    'No me llegó ninguna foto ni video con "%(text)s", así que no armé nada (%(name)s). '
+                    'Si querés cambiar una propuesta usando una foto que ya mandaste, *citá esa foto* y escribí el '
+                    'cambio; si no, reenviámela con el texto.') % {'text': text[:80], 'name': self.name})
             return
         brand = self.brand_id or self.operator_id.brand_id
         if brand:
@@ -284,6 +303,45 @@ class AutoContentRequest(models.Model):
             else:
                 self.operator_id._notify(_('Dale: %(format)s. Armo %(name)s…') % {
                     'format': formats[code][1].lower(), 'name': self.name})
+
+    def _extra_prompt(self, extra=None):
+        """Lo que se suma al pedido: el análisis de video, el formato y la memoria."""
+        self.ensure_one()
+        return '\n\n'.join(t for t in (extra, self._format_prompt(), self._history_prompt()) if t) or None
+
+    def _history_prompt(self):
+        """Las últimas piezas de la marca (diseño y color), para variar."""
+        self.ensure_one()
+        since = fields.Datetime.now() - timedelta(days=HISTORY_DAYS)
+        versions = self.env['auto.content.version'].sudo().search([
+            ('brand_id', '=', self.brand_id.id), ('request_id', '!=', self.id),
+            ('state', 'in', ('proposed', 'approved')), ('create_date', '>=', since),
+        ], order='id desc', limit=HISTORY_LIMIT)
+        if not versions:
+            return None
+        labels = {'approved': 'aprobada', 'proposed': 'propuesta'}
+        lines = []
+        for version in versions:
+            try:
+                plan = json.loads(version.plan_json or '{}')
+            except ValueError:
+                plan = {}
+            pieces = [plan] + list(plan.get('serie') or [])
+            designs = ', '.join('%s%s' % (p.get('diseno') or version.design,
+                                          ' (%s)' % p['datos']['color'] if (p.get('datos') or {}).get('color') else '')
+                                for p in pieces)
+            when = fields.Datetime.context_timestamp(self.with_context(tz=self.env.user.tz or 'America/Argentina/Buenos_Aires'), version.create_date).strftime('%d/%m %H:%M')
+            lines.append('- %s · %s · %s · %s' % (when, version.request_id.name, labels.get(version.state, ''), designs))
+        return ('## Últimas piezas de la marca (la más nueva primero)\n' + '\n'.join(lines)
+                + '\nNo repitas el diseño y color de la última; buscá variedad.')
+
+    def _keeps_media(self):
+        """Si el cambio pedido tiene que seguir usando la foto de la versión anterior."""
+        self.ensure_one()
+        previous = self._previous_plan()
+        if not previous or previous.get('media') is None or self.content_format == 'card':
+            return False
+        return not NO_MEDIA_WORDS.search(self.pending_instruction or '')
 
     def _format_prompt(self):
         prompt = next((f[3] for f in CONTENT_FORMATS if f[0] == self.content_format), None)
@@ -618,13 +676,13 @@ class AutoContentRequest(models.Model):
                 else:
                     _texts, _media, images = self._prepare_media(workdir)
                     ai_media, extra = self._ai_media(media)[:len(images)], None
-                extra = '\n\n'.join(t for t in (extra, self._format_prompt()) if t) or None
+                extra = self._extra_prompt(extra)
                 plan = brand._ai_plan(texts, ai_media, images, self._previous_plan(), instruction, extra, montage,
-                                      self.content_format)
+                                      self.content_format, self._keeps_media())
                 model = brand.llm_model
             else:
                 plan = planner.parse_plan(answer, brand._designs(), self._ai_media(media), montage,
-                                          self.content_format)
+                                          self.content_format, self._keeps_media())
                 model = 'Claude Code · %s' % (worker or brand.claude_model or '')
             output, kind, extras = self._render(plan, media, workdir)
         finally:
@@ -747,7 +805,7 @@ class AutoContentRequest(models.Model):
             else:
                 _texts, _media, images = self._prepare_media(workdir)
                 ai_media = self._ai_media(media)[:len(images)]
-            extra = '\n\n'.join(t for t in (extra, self._format_prompt()) if t) or None
+            extra = self._extra_prompt(extra)
             system_text, user_text = brand._prompts(
                 texts, ai_media, self._previous_plan(), self.pending_instruction, extra, montage)
             names = []
@@ -759,7 +817,8 @@ class AutoContentRequest(models.Model):
             for attempt in (1, 2):
                 answer = claude_cli.run(claude, brand.claude_model or 'sonnet', prompt, workdir, self._claude_home())
                 try:
-                    planner.parse_plan(answer, brand._designs(), self._ai_media(media), montage, self.content_format)
+                    planner.parse_plan(answer, brand._designs(), self._ai_media(media), montage, self.content_format,
+                                       self._keeps_media())
                     return answer
                 except planner.PlanError as exc:
                     if attempt == 2:
@@ -805,7 +864,7 @@ class AutoContentRequest(models.Model):
                     ai_media = request._ai_media(media)[:len(images)]
             finally:
                 shutil.rmtree(workdir, ignore_errors=True)
-            extra = '\n\n'.join(t for t in (extra, request._format_prompt()) if t) or None
+            extra = request._extra_prompt(extra)
             system_text, user_text = brand._prompts(
                 texts, ai_media, request._previous_plan(), request.pending_instruction, extra, montage,
             )
@@ -855,7 +914,7 @@ class AutoContentRequest(models.Model):
         montage = request._montage_context(media) if request._is_montage(media) else None
         try:
             plan = planner.parse_plan(answer, request.brand_id._designs(), request._ai_media(media), montage,
-                                      request.content_format)
+                                      request.content_format, request._keeps_media())
         except planner.PlanError as exc:
             return {'ok': False, 'retry': True, 'error': str(exc)}
         if montage:
