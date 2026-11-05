@@ -435,9 +435,11 @@ def _join_video(clips, segments, overlaps, ffmpeg, workdir):
 AMBIENT_LUFS = -20.0
 # Música según el "sonido" de cada clip en modo mezcla, y cuánto se corre el ambiente.
 MIX_LEVELS = {
-    'destacar': {'musica': -31.0, 'ambiente': 2.0},   # el sonido del clip manda (spray, alguien que habla)
-    'normal': {'musica': -26.0, 'ambiente': 0.0},     # música audible por debajo del ambiente
-    'musica': {'musica': -21.0, 'ambiente': -12.0},   # la música adelante, el ambiente de fondo
+    # El ruido de obra es parejo y tapa la música aunque esté apenas abajo:
+    # en los clips normales la música va un poco por encima del ambiente.
+    'destacar': {'musica': -27.0, 'ambiente': 1.0},   # el sonido del clip manda (spray, alguien que habla); la música sigue
+    'normal': {'musica': -20.0, 'ambiente': -4.0},    # música clara, el ambiente se oye por debajo
+    'musica': {'musica': -18.0, 'ambiente': -14.0},   # casi solo música
 }
 MUSIC_ONLY_LUFS = -18.0
 RAMP = 0.5
