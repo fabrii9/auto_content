@@ -431,6 +431,52 @@ def _join_video(clips, segments, overlaps, ffmpeg, workdir):
     return listing
 
 
+# Mezcla: niveles medidos (LUFS) antes de la normalización final.
+AMBIENT_LUFS = -20.0
+# Música según el "sonido" de cada clip en modo mezcla, y cuánto se corre el ambiente.
+MIX_LEVELS = {
+    'destacar': {'musica': -31.0, 'ambiente': 2.0},   # el sonido del clip manda (spray, alguien que habla)
+    'normal': {'musica': -26.0, 'ambiente': 0.0},     # música audible por debajo del ambiente
+    'musica': {'musica': -21.0, 'ambiente': -12.0},   # la música adelante, el ambiente de fondo
+}
+MUSIC_ONLY_LUFS = -18.0
+RAMP = 0.5
+
+
+def loudness(path, ffmpeg):
+    """Sonoridad integrada (LUFS) del audio de ``path``; ``None`` si es silencio."""
+    result = subprocess.run([ffmpeg, '-hide_banner', '-nostats', '-i', str(path), '-vn', '-af', 'ebur128',
+                             '-f', 'null', '-'], capture_output=True, text=True, timeout=180, **_CHILD)
+    found = re.findall(r'I:\s+(-?[\d.]+|-inf) LUFS', result.stderr)
+    if not found or found[-1] == '-inf' or float(found[-1]) < -60:
+        return None
+    return float(found[-1])
+
+
+def _envelope(starts, values):
+    """Expresión de ffmpeg para un volumen que cambia por clip, con rampas suaves."""
+    gain = lambda db: 10 ** (db / 20.0)
+    expr = '%.4f' % gain(values[0])
+    for start, before, after in zip(starts[1:], values, values[1:]):
+        if after != before:
+            expr += '+%.4f*clip((t-%.3f)/%.3f,0,1)' % (gain(after) - gain(before), start - RAMP / 2, RAMP)
+    return expr
+
+
+def _ambient_loudness(segments, audio_graph, audio, ffmpeg, workdir):
+    """Mide el sonido ambiente ya unido (mismo grafo de audio, en una pasada aparte)."""
+    probe_inputs = []
+    for segment in segments:
+        probe_inputs += ['-i', segment.name]
+    # En el grafo de la pasada final el segmento i es la entrada i+1; acá es la i.
+    audio_graph = [re.sub(r'\[(\d+):a\]', lambda m: '[%d:a]' % (int(m.group(1)) - 1), g) for g in audio_graph]
+    ambient = Path(workdir) / 'ambiente.wav'
+    _run([ffmpeg, '-y', '-loglevel', 'error'] + probe_inputs + [
+        '-filter_complex', ';'.join(audio_graph), '-map', '[%s]' % audio, '-ac', '2', ambient.name],
+        timeout=180, cwd=workdir)
+    return loudness(ambient, ffmpeg)
+
+
 def render_montage(clips, sources, out_path, width, height, ffmpeg, workdir, *,
                    audio_mode='original', music=None, capa=None, capa_hasta=None,
                    rotulos=None, transcripts=None, subtitle_style=None, font_path=None,
@@ -480,6 +526,7 @@ def render_montage(clips, sources, out_path, width, height, ffmpeg, workdir, *,
         else:
             graph.append('[%s][a%d]concat=n=2:v=0:a=1[ax%d]' % (audio, i, i))
         audio = 'ax%d' % i
+    audio_graph = [g for g in graph if not g.startswith('[0:v]')]
 
     def overlay_png(png, begin, end, label):
         nonlocal video, count
@@ -515,25 +562,37 @@ def render_montage(clips, sources, out_path, width, height, ffmpeg, workdir, *,
         graph.append('[%s]subtitles=subtitulos.ass:fontsdir=fuentes[vsub]' % video)
         video = 'vsub'
 
-    loudness = 'loudnorm=I=-16:TP=-1.5:LRA=11,aresample=48000'
+    final_loudness = 'loudnorm=I=-16:TP=-1.5:LRA=11,aresample=48000'
     if music and audio_mode in ('musica', 'mezcla'):
+        # Los niveles se miden y se equilibran: sin eso la música queda tapada
+        # por el ruido de obra (o lo tapa a él).
+        music_lufs = loudness(music['path'], ffmpeg) or -16.0
+        trim = float(music.get('ajuste_db') or 0)
         index = count
         inputs += ['-stream_loop', '-1', '-i', str(music['path'])]
-        level = float(music.get('volumen') or 0.25)
         if audio_mode == 'musica':
-            level = min(1.0, level * 3)
+            music_gain = '%.4f' % (10 ** ((MUSIC_ONLY_LUFS - music_lufs + trim) / 20.0))
+        else:
+            ambient_lufs = _ambient_loudness(segments, audio_graph, audio, ffmpeg, workdir)
+            sounds = [c.get('sonido') or 'normal' for c in clips]
+            music_gain = _envelope(starts, [MIX_LEVELS[x]['musica'] - music_lufs + trim for x in sounds])
+            if ambient_lufs is None:
+                ambient_gain = '1'
+            else:
+                ambient_gain = _envelope(starts, [AMBIENT_LUFS - ambient_lufs + MIX_LEVELS[x]['ambiente']
+                                                  for x in sounds])
         graph.append(
-            '[%d:a]atrim=0:%.3f,asetpts=PTS-STARTPTS,aresample=48000,aformat=channel_layouts=stereo,'
-            'volume=%.3f,afade=t=in:d=0.5,afade=t=out:st=%.3f:d=1.5[mus]' % (index, total, level, max(0, total - 1.5)))
+            "[%d:a]atrim=0:%.3f,asetpts=PTS-STARTPTS,aresample=48000,aformat=channel_layouts=stereo,"
+            "volume='%s':eval=frame,afade=t=in:d=0.5,afade=t=out:st=%.3f:d=1.5[mus]"
+            % (index, total, music_gain, max(0, total - 1.5)))
         if audio_mode == 'musica':
             graph.append('[%s]anullsink' % audio)
-            graph.append('[mus]%s[aout]' % loudness)
+            graph.append('[mus]%s[aout]' % final_loudness)
         else:
-            graph.append('[%s]asplit=2[voz][guia]' % audio)
-            graph.append('[mus][guia]sidechaincompress=threshold=0.02:ratio=8:attack=20:release=500[fondo]')
-            graph.append('[voz][fondo]amix=inputs=2:duration=first:normalize=0,%s[aout]' % loudness)
+            graph.append("[%s]volume='%s':eval=frame[amb]" % (audio, ambient_gain))
+            graph.append('[amb][mus]amix=inputs=2:duration=first:normalize=0,%s[aout]' % final_loudness)
     else:
-        graph.append('[%s]%s[aout]' % (audio, loudness))
+        graph.append('[%s]%s[aout]' % (audio, final_loudness))
 
     command = [ffmpeg, '-y', '-loglevel', 'error'] + inputs + [
         '-filter_complex', ';'.join(graph), '-map', '[%s]' % video, '-map', '[aout]',

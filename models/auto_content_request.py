@@ -615,6 +615,10 @@ class AutoContentRequest(models.Model):
                 parts.append(_('placa de cierre (%.1f s)') % clip['duracion'])
             if clip.get('rotulo'):
                 parts.append('«%s»' % clip['rotulo'])
+            if edit['audio'] == 'mezcla' and clip.get('sonido') == 'destacar':
+                parts.append(_('🔊 sonido del clip adelante'))
+            elif edit['audio'] == 'mezcla' and clip.get('sonido') == 'musica':
+                parts.append(_('🎵 música adelante'))
             lines.append('%d. %s' % (number, ' · '.join(parts)))
         audio = {'original': _('sonido original'), 'mezcla': _('sonido original + música'),
                  'musica': _('solo música')}[edit['audio']]

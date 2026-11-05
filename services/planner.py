@@ -58,7 +58,7 @@ Cómo ves los videos: por cada video recibís una o más hojas de contacto (cuad
 Además de las claves de siempre, respondé con la clave "montaje":
 "montaje": {{
   "clips": [
-    {{"video": <número de archivo>, "desde": <segundo>, "hasta": <segundo>, "transicion": "<cómo entra este clip>", "velocidad": 1, "estabilizar": false, "encuadre": 0.5, "rotulo": "<texto corto o null>"}},
+    {{"video": <número de archivo>, "desde": <segundo>, "hasta": <segundo>, "transicion": "<cómo entra este clip>", "velocidad": 1, "estabilizar": false, "encuadre": 0.5, "rotulo": "<texto corto o null>", "sonido": "<destacar | normal | musica>"}},
     {{"foto": <número de archivo>, "duracion": 3, "transicion": "fundido", "rotulo": null}}
   ],
   "audio": "<original | mezcla | musica>",
@@ -75,6 +75,11 @@ Reglas del montaje:
 - "rotulo": texto corto (hasta 40 caracteres) que aparece abajo durante ese clip. Solo datos del material; null si no hace falta.
 - "audio": "original" deja el sonido de los videos; "mezcla" suma música baja que se corre cuando alguien habla; "musica" tapa el sonido original con la música (para tomas con ruido sin interés).
 - Si nadie habla, poné música: "mezcla" si el sonido ambiente suma (máquinas, obra) o "musica" si es ruido. Elegí la pista según el ánimo del material.
+- "sonido" (solo con "mezcla") decide, clip por clip, quién manda en el audio. El sistema mide y equilibra los volúmenes; vos solo marcás cada clip:
+  - "normal": la música se escucha clara por debajo del sonido del clip. Es lo de siempre.
+  - "destacar": el sonido del clip va adelante y la música baja (alguien que habla, el spray, la motosierra, el golpe de una herramienta). Cuando termina el clip, la música vuelve sola.
+  - "musica": la música va adelante y el ambiente queda de fondo (tomas de paisaje o de ruido sin interés).
+  No escuchás el audio: decidilo por lo que se ve en los cuadros y por lo que pida el operador. Si pide "mantener el ruido de X", marcá "destacar" en los clips donde se ve X. Si pide "más música" o "que se escuche la música", usá "normal" o "musica".
 - "capa": la capa de marca con "diseno" y "datos" (un diseño que lleve foto o video, por ejemplo foto) sobre el video: "inicio" los primeros segundos, "todo" durante todo el video, "ninguna" sin capa. Mientras se ve la capa no se ven los subtítulos.
 - "cierre": una placa final opcional con un diseño que no use foto.
 - No cortes a una persona a mitad de frase si se escucha su voz. Si un video entero está mal (movido, oscuro, sin interés), no lo uses y avisalo en "alertas".
@@ -82,6 +87,8 @@ Reglas del montaje:
 Pistas de música disponibles:
 {musica}
 """
+
+SOUNDS = ('destacar', 'normal', 'musica')
 
 MEDIA_LABELS = {
     'requerida': 'necesita una foto o video',
@@ -285,6 +292,7 @@ def parse_montage(raw, designs, montage):
             'velocidad': 1.0,
             'estabilizar': False,
             'encuadre': 0.5,
+            'sonido': item.get('sonido') if item.get('sonido') in SOUNDS else 'normal',
         }
         if item.get('video') is not None:
             index = _index(item.get('video'))
