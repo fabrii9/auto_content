@@ -330,10 +330,14 @@ class AutoContentRequest(models.Model):
             designs = ', '.join('%s%s' % (p.get('diseno') or version.design,
                                           ' (%s)' % p['datos']['color'] if (p.get('datos') or {}).get('color') else '')
                                 for p in pieces)
+            music = (plan.get('montaje') or {}).get('musica')
+            if music:
+                designs += ' · video con música %s' % music
             when = fields.Datetime.context_timestamp(self.with_context(tz=self.env.user.tz or 'America/Argentina/Buenos_Aires'), version.create_date).strftime('%d/%m %H:%M')
             lines.append('- %s · %s · %s · %s' % (when, version.request_id.name, labels.get(version.state, ''), designs))
         return ('## Últimas piezas de la marca (la más nueva primero)\n' + '\n'.join(lines)
-                + '\nNo repitas el diseño y color de la última; buscá variedad.')
+                + '\nNo repitas el diseño y color de la última; buscá variedad. En los videos, no repitas la '
+                  'música de los últimos: elegí otra pista que vaya con el material.')
 
     def _keeps_media(self):
         """Si el cambio pedido tiene que seguir usando la foto de la versión anterior."""
