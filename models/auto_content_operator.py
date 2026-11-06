@@ -1,12 +1,17 @@
 # -*- coding: utf-8 -*-
 
+import json
 import logging
 import re
+import shutil
+import tempfile
 from datetime import timedelta
+from pathlib import Path
 
 from odoo import _, api, fields, models
 from odoo.exceptions import UserError, ValidationError
 
+from ..services import assistant, claude_cli, planner
 from ..services.whatsapp_out import WhatsAppSender
 
 _logger = logging.getLogger(__name__)
@@ -16,6 +21,9 @@ DISCARD_WORDS = {'descartar', 'descartada', 'no', 'borrar'}
 RETRY_WORDS = {'reintentar', 'reintenta', 'reintentá'}
 HELP_WORDS = {'ayuda', 'help', '?', 'marcas', '#marcas', '#ayuda'}
 START_WORDS = {'listo', 'lista', 'arranca', 'arrancá', 'empeza', 'empezá', 'eso es todo', 'nada mas', 'nada más'}
+CHAT_IDLE = timedelta(minutes=20)
+CHAT_HISTORY = 12
+END_CHAT_WORDS = {'#fin', '#salir', 'fin del chat', 'chau claude'}
 STATUS_WORDS = {'estado', 'como venis', 'cómo venís', 'como va', 'cómo va', 'como vas', 'novedades', 'y', 'y?'}
 IN_PROGRESS = ('queued', 'waiting_ai', 'processing')
 SUPPORTED_MEDIA = ('image', 'video', 'document')
@@ -58,6 +66,10 @@ class AutoContentOperator(models.Model):
         help='Al terminar de recibir el material, pregunta por WhatsApp qué armar (historia, collage, serie, video...).',
     )
     last_inbound_at = fields.Datetime(string='Último mensaje', readonly=True)
+    chat_until = fields.Datetime(string='Charla con Claude hasta', readonly=True,
+                                 help='Mientras dure, los textos sueltos van al asistente y no son material.')
+    chat_history = fields.Text(string='Charla con Claude', readonly=True)
+    chat_pending = fields.Text(string='Consultas pendientes', readonly=True)
 
     _phone_unique = models.Constraint(
         'UNIQUE(phone_key, wa_account_id)',
@@ -150,7 +162,15 @@ class AutoContentOperator(models.Model):
             '• Para cambiarla, escribí el código: %(brands)s\n'
             '• En la propuesta: Aprobar, Cambiar o Descartar.\n'
             '• "listo" arranca sin esperar; "estado" te dice cómo va.\n'
-            '• "reintentar" vuelve a intentar la última que falló.'
+            '• "reintentar" vuelve a intentar la última que falló.\n\n'
+            '*Hablar con Claude*\n'
+            '• *#claude* y tu pregunta: te responde una vez.\n'
+            '• *#chat*: conversás con Claude (lo que escribas no es material) hasta *#fin* o 20 min sin mensajes.\n'
+            '  Le podés preguntar cómo va algo, por qué salió así una pieza, pedirle un cambio ("cambiale la música '
+            'a AC/0026") o algo nuevo para el sistema (lo anota como pedido de desarrollo).\n\n'
+            '*Reglas* (la IA las cumple en cada pieza)\n'
+            '• *#regla* y el texto: suma una. Ej.: #regla las bajadas de hasta 12 palabras\n'
+            '• *#reglas*: la lista. *#quitar 2*: borra la regla 2.'
         ) % {
             'wait': self.debounce_seconds,
             'active': self.brand_id.name or _('ninguna'),
@@ -231,6 +251,9 @@ class AutoContentOperator(models.Model):
             return
         low = body.lower().strip(' .!¡¿?')
 
+        if self._handle_command(msg_uid, body):
+            return
+
         if body.startswith('#') and body.lower() not in HELP_WORDS:
             code, rest = (body[1:].split(None, 1) + [''])[:2]
             brand = self.env['auto.content.brand'].sudo().search(
@@ -297,6 +320,11 @@ class AutoContentOperator(models.Model):
             waiting_change._add_inbound(msg_uid, 'text', body=body, counts_as_material=False)
             waiting_change._request_change(body)
             return
+        if self._in_chat() and not collecting:
+            Message.create({'msg_uid': msg_uid, 'operator_id': self.id, 'kind': 'text', 'body': body,
+                            'is_material': False})
+            self._queue_chat(body)
+            return
 
         in_review = Request.search([('operator_id', '=', self.id), ('state', '=', 'review')], limit=1)
         if in_review and low in APPROVE_WORDS:
@@ -356,6 +384,209 @@ class AutoContentOperator(models.Model):
         label = 'el video' if quoted.kind == 'video' else 'la foto'
         return request, _('%(body)s\n(El operador citó %(label)s número %(n)d: usá ese archivo en "media".)') % {
             'body': body, 'label': label, 'n': number}
+
+    # ------------------------------------------------------------------
+    # Comandos, reglas y charla con Claude
+    # ------------------------------------------------------------------
+    def _in_chat(self):
+        self.ensure_one()
+        return bool(self.chat_until and self.chat_until > fields.Datetime.now())
+
+    def _handle_command(self, msg_uid, body):
+        """#regla, #reglas, #quitar, #claude, #chat y #fin. ``True`` si lo era."""
+        self.ensure_one()
+        low = body.lower().strip()
+        word, rest = (low.split(None, 1) + [''])[:2]
+        text = body.strip()[len(word):].strip()
+        if word not in ('#regla', '#reglas', '#quitar', '#claude', '#chat', '#fin', '#salir'):
+            return False
+        self.env['auto.content.message'].sudo().create(
+            {'msg_uid': msg_uid, 'operator_id': self.id, 'kind': 'text', 'body': body, 'is_material': False})
+        brand = self.brand_id
+        if word in ('#regla', '#reglas', '#quitar') and not brand:
+            self._notify(_('Primero elegí la marca (#ayuda te dice cómo).'))
+            return True
+        if word == '#regla':
+            if not text:
+                self._notify(_('Escribí la regla después de #regla. Ej.: #regla las bajadas de hasta 12 palabras'))
+            else:
+                self._add_rule(text)
+        elif word == '#reglas':
+            self._notify(self._rules_text())
+        elif word == '#quitar':
+            number = re.search(r'\d+', rest)
+            if not number:
+                self._notify(_('Decime el número: #quitar 2 (la lista está en #reglas).'))
+            else:
+                self._remove_rule(int(number.group(0)))
+        elif word == '#claude':
+            if not text:
+                self._notify(_('Escribí la pregunta después de #claude, o usá #chat para conversar.'))
+            else:
+                self._queue_chat(text)
+        elif word == '#chat':
+            self.write({'chat_until': fields.Datetime.now() + CHAT_IDLE})
+            self._notify(_('💬 Charla con Claude abierta. Lo que escribas va a Claude y no es material para '
+                           'piezas (las fotos y videos sí). Cerrala con *#fin*; se cierra sola a los 20 min sin '
+                           'mensajes.'))
+            if text:
+                self._queue_chat(text)
+        else:
+            self.write({'chat_until': False, 'chat_history': False})
+            self._notify(_('Charla cerrada. Lo que escribas vuelve a ser material para piezas.'))
+        return True
+
+    def _rules_text(self):
+        rules = self.brand_id._rule_list()
+        if not rules:
+            return _('%s no tiene reglas. Sumá una con #regla y el texto.') % self.brand_id.name
+        return _('*Reglas de %(brand)s*\n%(list)s\n\nPara borrar una: #quitar y el número.') % {
+            'brand': self.brand_id.name, 'list': '\n'.join('%d. %s' % (n, r) for n, r in enumerate(rules, 1))}
+
+    def _add_rule(self, text, notify=True):
+        brand = self.brand_id.sudo()
+        rules = brand._rule_list() + [text.strip()]
+        brand.rules = '\n'.join(rules)
+        brand.message_post(body=_('Regla %(n)d cargada por WhatsApp (%(op)s): %(rule)s') % {
+            'n': len(rules), 'op': self.name, 'rule': text.strip()})
+        if notify:
+            self._notify(_('✅ Regla %(n)d guardada: %(rule)s\nRige desde la próxima pieza.') % {
+                'n': len(rules), 'rule': text.strip()})
+        return len(rules)
+
+    def _remove_rule(self, number, notify=True):
+        brand = self.brand_id.sudo()
+        rules = brand._rule_list()
+        if not 1 <= number <= len(rules):
+            if notify:
+                self._notify(_('No hay regla %d. Mirá la lista con #reglas.') % number)
+            return None
+        removed = rules.pop(number - 1)
+        brand.rules = '\n'.join(rules)
+        brand.message_post(body=_('Regla quitada por WhatsApp (%(op)s): %(rule)s') % {'op': self.name, 'rule': removed})
+        if notify:
+            self._notify(_('🗑️ Quité la regla: %s') % removed)
+        return removed
+
+    def _queue_chat(self, text):
+        self.ensure_one()
+        pending = json.loads(self.chat_pending or '[]') + [text]
+        values = {'chat_pending': json.dumps(pending, ensure_ascii=False)}
+        if self._in_chat():
+            values['chat_until'] = fields.Datetime.now() + CHAT_IDLE
+        self.write(values)
+        cron = self.env.ref('auto_content.cron_responder_consultas', raise_if_not_found=False)
+        if cron:
+            cron.sudo()._trigger()
+
+    @api.model
+    def _cron_chat(self):
+        for operator in self.search([('chat_pending', '!=', False)]):
+            try:
+                operator._answer_chat()
+            except Exception as exc:  # noqa: BLE001 - se le avisa al operador y se sigue con el resto
+                _logger.exception('auto_content: no pude responder la consulta de %s', operator.name)
+                operator.chat_pending = False
+                operator._notify(_('No pude responderte: %s') % str(exc)[:300])
+            self.env.cr.commit()
+
+    def _chat_context(self):
+        self.ensure_one()
+        brand = self.brand_id
+        Request = self.env['auto.content.request'].sudo()
+        labels = dict(Request._fields['state'].selection)
+        formats = '\n'.join('- %s: %s' % (f[1], f[2]) for f in Request._content_formats())
+        designs = planner.describe_designs(brand._designs()) if brand else '(sin marca)'
+        music = planner.describe_music((brand._video_config() or {}).get('musica')) if brand else ''
+        rules = '\n'.join('%d. %s' % (n, r) for n, r in enumerate(brand._rule_list(), 1)) if brand else ''
+        lines = []
+        for request in Request.search([('operator_id', '=', self.id)], order='id desc', limit=8):
+            version = request.current_version_id
+            when = fields.Datetime.context_timestamp(
+                self.with_context(tz=self.env.user.tz or 'America/Argentina/Buenos_Aires'), request.create_date)
+            line = '- %s (%s, %s, formato %s, %d archivos)' % (
+                request.name, when.strftime('%d/%m %H:%M'), labels.get(request.state, request.state),
+                request.content_format, request.media_count)
+            if version:
+                line += ': v%d %s. %s' % (version.sequence, version.design or '', version.summary or '')
+                if version.instruction:
+                    line += ' Último cambio pedido: "%s".' % version.instruction
+                if version.script:
+                    line += ' Guion: %s' % ' | '.join(version.script.splitlines())[:700]
+                if version.alerts:
+                    line += ' Alertas: %s' % ' | '.join(version.alerts.splitlines())[:300]
+            if request.error_message:
+                line += ' Error: %s' % request.error_message[:200]
+            lines.append(line)
+        return {
+            'operador': self.name, 'marca': brand.name if brand else '(sin marca)',
+            'ayuda': self._help_text(), 'formatos': formats, 'disenos': designs, 'musica': music or '(sin música)',
+            'reglas': rules or '(ninguna)', 'solicitudes': '\n'.join(lines) or '(ninguna)',
+        }
+
+    def _answer_chat(self):
+        self.ensure_one()
+        questions = json.loads(self.chat_pending or '[]')
+        self.chat_pending = False
+        if not questions:
+            return
+        question = '\n'.join(questions)
+        history = json.loads(self.chat_history or '[]') if self._in_chat() else []
+        Request = self.env['auto.content.request'].sudo()
+        claude = claude_cli.find_claude(Request._param('claude_path'))
+        model = self.brand_id.claude_model or 'sonnet'
+        workdir = Path(tempfile.mkdtemp(prefix='auto-content-chat-'))
+        try:
+            prompt = assistant.build_prompt(self._chat_context(), history, question)
+            answer = claude_cli.run(claude, model, prompt, workdir, Request._claude_home(), timeout=240, max_turns=4)
+        finally:
+            shutil.rmtree(workdir, ignore_errors=True)
+        reply, actions = assistant.parse_answer(answer)
+        done = [self._run_chat_action(action) for action in actions]
+        done = [d for d in done if d]
+        if done:
+            reply += '\n\n' + '\n'.join(done)
+        self._notify(reply)
+        if self._in_chat():
+            history += [{'rol': 'operador', 'texto': question}, {'rol': 'claude', 'texto': reply}]
+            self.chat_history = json.dumps(history[-CHAT_HISTORY:], ensure_ascii=False)
+
+    def _run_chat_action(self, action):
+        """Ejecuta una acción del asistente y devuelve una línea para el operador."""
+        kind = action.get('tipo')
+        if kind in ('agregar_regla', 'quitar_regla') and not self.brand_id:
+            return _('⚠️ No hay marca activa para las reglas.')
+        if kind == 'agregar_regla' and (action.get('texto') or '').strip():
+            number = self._add_rule(action['texto'], notify=False)
+            return _('✅ Regla %(n)d guardada: %(rule)s') % {'n': number, 'rule': action['texto'].strip()}
+        if kind == 'quitar_regla':
+            try:
+                removed = self._remove_rule(int(action.get('numero')), notify=False)
+            except (TypeError, ValueError):
+                removed = None
+            return _('🗑️ Quité la regla: %s') % removed if removed else _('⚠️ No encontré esa regla.')
+        if kind == 'pedir_cambio':
+            name = (action.get('solicitud') or '').strip().upper()
+            request = self.env['auto.content.request'].sudo().search(
+                [('name', '=', name), ('operator_id', '=', self.id)], limit=1)
+            instruction = (action.get('instruccion') or '').strip()
+            if not request or not request.current_version_id or not instruction:
+                return _('⚠️ No pude pedir el cambio en %s.') % (name or '?')
+            if request.state not in ('review', 'approved', 'discarded', 'feedback'):
+                return _('⚠️ %s todavía se está armando; pedí el cambio cuando llegue.') % name
+            request._add_inbound('chat-%s-%s' % (request.id, fields.Datetime.now().timestamp()), 'text',
+                                 body=instruction, counts_as_material=False)
+            request._request_change(instruction)
+            return _('🔁 Pedí el cambio en %(name)s: "%(text)s"') % {'name': name, 'text': instruction}
+        if kind == 'pedido_desarrollo' and (action.get('texto') or '').strip():
+            target = self.brand_id.sudo() if self.brand_id else None
+            body = _('Pedido de desarrollo por WhatsApp (%(op)s): %(text)s') % {
+                'op': self.name, 'text': action['texto'].strip()}
+            if target:
+                target.message_post(body=body)
+            _logger.info('auto_content: %s', body)
+            return _('📝 Anotado como pedido de desarrollo.')
+        return None
 
     def _status_text(self):
         self.ensure_one()

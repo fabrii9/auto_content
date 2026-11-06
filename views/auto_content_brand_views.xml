@@ -73,6 +73,8 @@
                         </page>
                         <page string="Ajustes de instrucciones" name="extra">
                             <field name="extra_instructions" placeholder="Por ejemplo: esta semana destacá la obra de la línea de Lomas Este."/>
+                            <separator string="Reglas cargadas por WhatsApp (#regla)"/>
+                            <field name="rules" placeholder="Una regla por línea."/>
                         </page>
                         <page string="Diseños" name="designs">
                             <field name="designs_json" widget="ace" options="{'mode': 'json'}"/>

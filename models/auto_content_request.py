@@ -247,6 +247,10 @@ class AutoContentRequest(models.Model):
         self.state = 'brand'
         self._ask_brand()
 
+    @api.model
+    def _content_formats(self):
+        return CONTENT_FORMATS
+
     def _format_options(self):
         """Los formatos que tienen sentido para el material recibido."""
         self.ensure_one()

@@ -51,6 +51,10 @@ class AutoContentBrand(models.Model):
         string='Ajustes de instrucciones',
         help='Se suman a las instrucciones del paquete sin tener que volver a cargarlo.',
     )
+    rules = fields.Text(
+        string='Reglas (por WhatsApp)',
+        help='Una por línea. Se cargan por WhatsApp con #regla y la IA las sigue en cada pieza.',
+    )
     place_ids = fields.One2many('auto.content.place', 'brand_id', string='Lugares')
 
     ai_mode = fields.Selection(
@@ -179,11 +183,25 @@ class AutoContentBrand(models.Model):
     # ------------------------------------------------------------------
     # IA
     # ------------------------------------------------------------------
+    def _rule_list(self):
+        self.ensure_one()
+        return [line.strip() for line in (self.rules or '').splitlines() if line.strip()]
+
+    def _adjustments(self):
+        """Los ajustes escritos en Odoo más las reglas cargadas por WhatsApp."""
+        self.ensure_one()
+        parts = [self.extra_instructions or '']
+        rules = self._rule_list()
+        if rules:
+            parts.append('Reglas del operador (cumplilas siempre, salvo que un pedido puntual diga otra cosa):\n'
+                         + '\n'.join('%d. %s' % (n, rule) for n, rule in enumerate(rules, 1)))
+        return '\n\n'.join(p for p in parts if p.strip())
+
     def _prompts(self, texts, media, previous_plan=None, instruction=None, extra=None, montage=None):
         """``(system, user)`` para la IA; los mismos en los dos modos."""
         self.ensure_one()
         system_text = planner.build_system_prompt(
-            self.name, self._designs(), self._places(), self.instructions, self.knowledge, self.extra_instructions,
+            self.name, self._designs(), self._places(), self.instructions, self.knowledge, self._adjustments(),
             video=montage['cfg'] if montage else None,
             series=bool(montage and montage.get('modo') == 'serie'),
         )
