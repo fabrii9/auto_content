@@ -27,6 +27,7 @@ MAX_MEDIA_FOR_AI = 6
 # Montajes: fotos + hojas de contacto que ve la IA.
 MAX_IMAGES_MONTAGE = 12
 MAX_PHOTOS_MONTAGE = 4
+MAX_PHOTOS_SERIES = 6
 VIDEO_DEBOUNCE = 120
 FORMAT_WAIT = timedelta(minutes=10)
 # Formatos que se ofrecen por WhatsApp: (código, título, descripción, instrucción para la IA).
@@ -42,6 +43,10 @@ CONTENT_FORMATS = [
     ('before_after', 'Antes y después', 'Dos fotos comparadas en una historia',
      'Armá un antes y después: un diseño de varias fotos con 2 fotos, la primera es el antes y la segunda el '
      'después, con pies que empiecen con "Antes" y "Después". Si no se distingue cuál es cuál, avisalo en "alertas".'),
+    ('mixed', 'Historias + video', 'Fotos en historias y el video editado como una más',
+     'Armá una serie: la historia principal con una foto y, en "serie", otra historia de fotos si hace falta y '
+     'cada video editado como una historia más (con "montaje"), todo con el mismo estilo. No dejes afuera ningún '
+     'video.'),
     ('video', 'Video editado', 'Un video con las mejores partes y música',
      'Armá un video (montaje) con el material.'),
     ('card', 'Placa con texto', 'Un aviso o un dato, sin foto',
@@ -255,6 +260,7 @@ class AutoContentRequest(models.Model):
             'collage': photos >= 2,
             'series': len(media) >= 2,
             'before_after': photos >= 2,
+            'mixed': video_ready and photos >= 1 and videos >= 1,
             'video': video_ready and (videos >= 1 or photos >= 2),
             'card': True,
         }
@@ -429,6 +435,15 @@ class AutoContentRequest(models.Model):
             return True
         return self.content_format == 'auto' and any(m['kind'] == 'video' for m in media)
 
+    def _is_video_series(self, media):
+        """Serie con fotos y videos: cada video va editado como una historia más."""
+        self.ensure_one()
+        return (bool(self.brand_id._video_config()) and self.content_format in ('series', 'mixed')
+                and any(m['kind'] == 'video' for m in media))
+
+    def _uses_videos(self, media):
+        return self._is_montage(media) or self._is_video_series(media)
+
     def _video_analysis(self, media, workdir):
         """Analiza cada video una sola vez (duración, cambios de toma y hojas de
         contacto, que quedan como adjuntos) y lo guarda en la solicitud."""
@@ -469,6 +484,7 @@ class AutoContentRequest(models.Model):
         analysis = analysis or json.loads(self.analysis_json or '{}')
         indexes = {str(m['index']) for m in media if m['kind'] == 'video'}
         return {
+            'modo': 'serie' if self._is_video_series(media) else 'montaje',
             'cfg': self.brand_id._video_config(),
             'videos': {k: v for k, v in (analysis.get('videos') or {}).items() if k in indexes},
             'fotos': [m['index'] for m in media if m['kind'] == 'image'],
@@ -494,7 +510,9 @@ class AutoContentRequest(models.Model):
         y el texto con los cambios de toma y lo que se dice."""
         self.ensure_one()
         images, ai_media = [], []
-        photos = [m for m in media if m['kind'] == 'image'][:MAX_PHOTOS_MONTAGE]
+        # En una serie con video las fotos son historias: se muestran más.
+        limit = MAX_PHOTOS_SERIES if self._is_video_series(media) else MAX_PHOTOS_MONTAGE
+        photos = [m for m in media if m['kind'] == 'image'][:limit]
         videos = [m for m in media if m['kind'] == 'video']
         per_video = max(1, (MAX_IMAGES_MONTAGE - len(photos)) // max(1, len(videos)))
         for item in media:
@@ -675,7 +693,7 @@ class AutoContentRequest(models.Model):
         try:
             texts, media = self._write_media(workdir)
             montage = None
-            if self._is_montage(media):
+            if self._uses_videos(media):
                 analysis = self._video_analysis(media, workdir)
                 montage = self._montage_context(media, analysis)
             if answer is None:
@@ -721,14 +739,28 @@ class AutoContentRequest(models.Model):
             'res_model': version._name,
             'res_id': version.id,
         })
-        for position, raw in enumerate(extras.get('serie') or [], 2):
-            version.extra_attachment_ids = [(4, self.env['ir.attachment'].sudo().create({
-                'name': '%s-%s-v%d-historia%d.png' % (brand.code, self.name.replace('/', ''), number, position),
-                'raw': raw,
-                'mimetype': 'image/png',
+        Attachment = self.env['ir.attachment'].sudo()
+        scripts = []
+        for position, piece in enumerate(extras.get('serie') or [], 2):
+            video = piece['kind'] == 'video'
+            base = '%s-%s-v%d-historia%d' % (brand.code, self.name.replace('/', ''), number, position)
+            extra = Attachment.create({
+                'name': base + ('.mp4' if video else '.png'),
+                'raw': piece['raw'],
+                'mimetype': 'video/mp4' if video else 'image/png',
                 'res_model': version._name,
                 'res_id': version.id,
-            }).id)]
+            })
+            version.extra_attachment_ids = [(4, extra.id)]
+            if video and piece.get('preview'):
+                # Vista liviana para WhatsApp (16 MB); queda fuera de las historias.
+                Attachment.create({'name': base + '-vista.mp4', 'raw': piece['preview'], 'mimetype': 'video/mp4',
+                                   'res_model': version._name, 'res_id': version.id,
+                                   'description': 'vista:%d' % extra.id})
+            if piece.get('script'):
+                scripts.append(_('Historia %(n)d (video):\n%(script)s') % {'n': position, 'script': piece['script']})
+        if scripts:
+            version.script = '\n\n'.join(([version.script] if version.script else []) + scripts)
         if extras.get('preview'):
             version.preview_attachment_id = self.env['ir.attachment'].sudo().create({
                 'name': '%s-%s-v%d-vista.mp4' % (brand.code, self.name.replace('/', ''), number),
@@ -762,8 +794,18 @@ class AutoContentRequest(models.Model):
         if plan.get('montaje'):
             return self._render_montage(plan, media, workdir)
         output, kind = self._render_piece(plan, media, workdir, 'pieza')
-        series = [self._render_piece(piece, media, workdir, 'pieza-%d' % number)[0]
-                  for number, piece in enumerate(plan.get('serie') or [], 2)]
+        series = []
+        for number, piece in enumerate(plan.get('serie') or [], 2):
+            if piece.get('montaje'):
+                # Historia de video editada: cada una en su carpeta (el montaje usa nombres fijos).
+                folder = workdir / ('video-%d' % number)
+                folder.mkdir()
+                raw, _kind, extras = self._render_montage(piece, media, folder)
+                series.append({'raw': raw, 'kind': 'video', 'preview': extras.get('preview'),
+                               'script': extras.get('script')})
+            else:
+                series.append({'raw': self._render_piece(piece, media, workdir, 'pieza-%d' % number)[0],
+                               'kind': 'image'})
         return output, kind, {'serie': series}
 
     def _render_piece(self, plan, media, workdir, name):
@@ -806,7 +848,7 @@ class AutoContentRequest(models.Model):
         try:
             texts, media = self._write_media(workdir)
             montage = extra = None
-            if self._is_montage(media):
+            if self._uses_videos(media):
                 analysis = self._video_analysis(media, workdir)
                 montage = self._montage_context(media, analysis)
                 images, ai_media, extra = self._montage_inputs(media, analysis)
@@ -862,7 +904,7 @@ class AutoContentRequest(models.Model):
             try:
                 texts, media = request._write_media(workdir)
                 montage = extra = None
-                if request._is_montage(media):
+                if request._uses_videos(media):
                     analysis = request._video_analysis(media, workdir)
                     montage = request._montage_context(media, analysis)
                     images, ai_media, extra = request._montage_inputs(media, analysis)
@@ -919,7 +961,7 @@ class AutoContentRequest(models.Model):
         if transcripts:
             request._store_transcripts(transcripts)
         _texts, media = request._material()
-        montage = request._montage_context(media) if request._is_montage(media) else None
+        montage = request._montage_context(media) if request._uses_videos(media) else None
         try:
             plan = planner.parse_plan(answer, request.brand_id._designs(), request._ai_media(media), montage,
                                       request.content_format, request._keeps_media())
@@ -928,11 +970,11 @@ class AutoContentRequest(models.Model):
         if montage:
             request.write({'state': 'queued', 'pending_answer': answer, 'pending_worker': worker or False})
             request._trigger_cron()
-            if request.operator_id:
+            edit = plan.get('montaje') or next((p['montaje'] for p in plan.get('serie') or [] if p.get('montaje')), None)
+            if request.operator_id and edit:
                 request.operator_id._notify(_('🎬 Editando el video de %(name)s (%(dur).0f s, %(clips)d clips). '
                                               'Tarda unos minutos.') % {
-                    'name': request.name, 'dur': plan['montaje']['duracion'],
-                    'clips': len(plan['montaje']['clips'])})
+                    'name': request.name, 'dur': edit['duracion'], 'clips': len(edit['clips'])})
             return {'ok': True, 'retry': False, 'state': 'queued', 'error': False}
         request._run(answer=answer, worker=worker)
         return {'ok': request.state == 'review', 'retry': False, 'state': request.state,
@@ -1073,10 +1115,21 @@ class AutoContentVersion(models.Model):
                 uids.append(sender.text(_('%(caption)s en calidad original (%(mb).0f MB):\n%(url)s') % {
                     'caption': caption, 'mb': size / 1024 / 1024, 'url': self._download_url()}))
         else:
-            pieces = attachment | self.extra_attachment_ids
+            pieces = attachment | self.extra_attachment_ids.sorted("id")
             for number, piece in enumerate(pieces, 1):
                 label = caption if len(pieces) == 1 else _('%(caption)s · historia %(n)d de %(total)d') % {
                     'caption': caption, 'n': number, 'total': len(pieces)}
+                if piece.mimetype == 'video/mp4':
+                    weight = len(piece.raw or b'')
+                    light = piece if weight <= MAX_VIDEO_BYTES else self.env['ir.attachment'].sudo().search(
+                        [('res_model', '=', self._name), ('res_id', '=', self.id),
+                         ('description', '=', 'vista:%d' % piece.id)], limit=1)
+                    if light:
+                        uids.append(sender.media(light, 'video', caption=label))
+                    if light != piece:
+                        uids.append(sender.text(_('%(label)s en calidad original (%(mb).0f MB):\n%(url)s') % {
+                            'label': label, 'mb': weight / 1024 / 1024, 'url': self._download_url(piece)}))
+                    continue
                 if len(piece.raw or b'') <= MAX_IMAGE_BYTES:
                     uids.append(sender.media(piece, 'image', caption=label))
                 uids.append(sender.media(piece, 'document', caption=_('%s en calidad original') % label))
@@ -1090,9 +1143,9 @@ class AutoContentVersion(models.Model):
         ]))
         self.wa_msg_uids = ' '.join(uid for uid in uids if uid)
 
-    def _download_url(self):
+    def _download_url(self, attachment=None):
         self.ensure_one()
-        attachment = self.output_attachment_id.sudo()
+        attachment = (attachment or self.output_attachment_id).sudo()
         token = attachment.access_token or attachment.generate_access_token()[0]
         return '%s/web/content/%d?access_token=%s&download=true' % (attachment.get_base_url(), attachment.id, token)
 

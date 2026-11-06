@@ -185,6 +185,7 @@ class AutoContentBrand(models.Model):
         system_text = planner.build_system_prompt(
             self.name, self._designs(), self._places(), self.instructions, self.knowledge, self.extra_instructions,
             video=montage['cfg'] if montage else None,
+            series=bool(montage and montage.get('modo') == 'serie'),
         )
         return system_text, planner.build_user_prompt(texts, media, previous_plan, instruction, extra)
 

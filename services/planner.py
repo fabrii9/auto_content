@@ -90,6 +90,15 @@ Pistas de música disponibles:
 
 SOUNDS = ('destacar', 'normal', 'musica')
 
+SERIES_VIDEO_PROMPT = """
+# Serie con video
+Esta vez la pieza es una SERIE de historias que mezcla fotos y video. No pongas "montaje" en el nivel principal: la historia principal es de foto ("diseno", "media" y "datos" como siempre) y en "serie" van hasta {max_serie} historias más.
+- Cada video que llegó va como UNA historia de la serie, editada con el guion de arriba: {{"diseno": "foto", "datos": {{...la capa de marca...}}, "montaje": {{...}}}} (sin "media").
+- No dejes afuera ningún video: solo si está movido, oscuro o sin interés, y en ese caso avisalo en "alertas".
+- La historia de video es parte de la misma serie: misma etiqueta y mismo tono, con un titular que continúe la historia anterior (no lo repitas). Ponela donde pida el operador o donde mejor siga el relato.
+- En el montaje de una serie: de 10 a 30 s, "capa": "inicio" con un titular corto, y sin fotos en los clips (las fotos ya van en las otras historias).
+"""
+
 MEDIA_LABELS = {
     'requerida': 'necesita una foto o video',
     'opcional': 'puede llevar foto o video',
@@ -130,7 +139,8 @@ def describe_music(tracks):
     return '\n'.join(lines) or '(no hay música: usá "audio": "original")'
 
 
-def build_system_prompt(name, designs, places, instructions, knowledge, extra_instructions='', video=None):
+def build_system_prompt(name, designs, places, instructions, knowledge, extra_instructions='', video=None,
+                        series=False):
     """``video`` es la sección "video" del paquete y se pasa solo si hay que montar."""
     instructions = (instructions or '').strip()
     if extra_instructions:
@@ -149,6 +159,8 @@ def build_system_prompt(name, designs, places, instructions, knowledge, extra_in
             transiciones=', '.join('"%s"' % t for t in video.get('transiciones') or ['corte', 'fundido']),
             musica=describe_music(video.get('musica')),
         )
+        if series:
+            text += SERIES_VIDEO_PROMPT.format(max_serie=MAX_SERIES_VIDEO)
     return text
 
 
@@ -365,6 +377,23 @@ def parse_montage(raw, designs, montage):
 
 
 MAX_SERIES = 2
+MAX_SERIES_VIDEO = 3
+
+
+def _parse_video_piece(piece, designs, montage, label):
+    """Una historia de video editada dentro de una serie."""
+    design = piece.get('diseno') or 'foto'
+    if design not in designs:
+        raise PlanError('%s eligió un diseño que no existe: %r.' % (label, design))
+    if designs[design].get('solo_fotos'):
+        raise PlanError('%s: el diseño %s es solo para fotos; para la capa del video usá foto.' % (label, design))
+    edit = parse_montage(piece.get('montaje'), designs, montage)
+    if edit['capa'] != 'ninguna' and designs[design].get('media', 'no') == 'no':
+        raise PlanError('%s: para la capa sobre el video usá un diseño con foto (o "capa": "ninguna").' % label)
+    data = piece.get('datos') if isinstance(piece.get('datos'), dict) else {}
+    for reserved in ('foto', 'fotos', 'transparente', 'plantilla'):
+        data.pop(reserved, None)
+    return {'diseno': design, 'media': None, 'datos': data, 'montaje': edit}
 
 
 def _parse_piece(design, index, data, designs, media, label='El plan'):
@@ -421,7 +450,8 @@ def parse_plan(text, designs, media, montage=None, content_format=None, keep_med
     if design not in designs:
         raise PlanError('La IA eligió un diseño que no existe: %r.' % design)
     mode = designs[design].get('media', 'no')
-    edit = parse_montage(plan.get('montaje'), designs, montage) if montage else None
+    series_video = bool(montage and montage.get('modo') == 'serie')
+    edit = parse_montage(plan.get('montaje'), designs, montage) if montage and not series_video else None
     if edit and edit['capa'] != 'ninguna' and mode == 'no':
         raise PlanError('Para la capa sobre el video usá un diseño que lleve foto o video (o "capa": "ninguna").')
     if edit and edit['capa'] != 'ninguna' and designs[design].get('solo_fotos'):
@@ -437,8 +467,11 @@ def parse_plan(text, designs, media, montage=None, content_format=None, keep_med
         design, index, data = _parse_piece(design, plan.get('media'), plan.get('datos'), designs, media)
     series = []
     if not edit:
-        for number, piece in enumerate((plan.get('serie') or [])[:MAX_SERIES], 2):
+        for number, piece in enumerate((plan.get('serie') or [])[:MAX_SERIES_VIDEO if series_video else MAX_SERIES], 2):
             if not isinstance(piece, dict):
+                continue
+            if series_video and piece.get('montaje') is not None:
+                series.append(_parse_video_piece(piece, designs, montage, 'La historia %d de la serie' % number))
                 continue
             series.append(dict(zip(('diseno', 'media', 'datos'), _parse_piece(
                 piece.get('diseno'), piece.get('media'), piece.get('datos'), designs, media,
@@ -462,6 +495,9 @@ def parse_plan(text, designs, media, montage=None, content_format=None, keep_med
     if series and content_format not in ('story', 'collage', 'before_after', 'card'):
         result['serie'] = series
     _check_format(result, designs, content_format)
+    if series_video and montage.get('videos') and not any(p.get('montaje') for p in result.get('serie') or []):
+        raise PlanError('Llegaron videos y no están en la serie: sumá cada video como una historia con "montaje" '
+                        'dentro de "serie".')
     if keep_media and not edit and designs[design].get('media', 'no') == 'no':
         raise PlanError('La versión anterior llevaba foto y el operador no pidió sacarla: usá un diseño con foto '
                         '(otra variante o color si pidió otro estilo).')
@@ -474,7 +510,7 @@ def _check_format(plan, designs, content_format):
     if content_format in ('collage', 'before_after') and mode != 'varias':
         raise PlanError('El operador pidió %s: usá un diseño de varias fotos.' % (
             'un collage' if content_format == 'collage' else 'un antes y después'))
-    if content_format == 'series' and not plan.get('serie'):
+    if content_format in ('series', 'mixed') and not plan.get('serie'):
         raise PlanError('El operador pidió una serie: sumá 1 o 2 historias en "serie".')
     if content_format == 'card' and mode != 'no':
         raise PlanError('El operador pidió una placa con texto: usá un diseño sin foto.')
