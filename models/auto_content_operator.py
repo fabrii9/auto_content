@@ -659,7 +659,7 @@ class AutoContentOperator(models.Model):
             request = self.env['auto.content.request'].sudo().browse(int(parts[2])).exists()
             Message.create({'msg_uid': msg_uid, 'operator_id': self.id, 'kind': 'button', 'body': button_id, 'is_material': False,
                             'request_id': request.id if request else False})
-            if request and request.operator_id == self and request.state == 'format':
+            if request and request.operator_id == self and request.state in ('format', 'collecting'):
                 request._choose_format(parts[3])
             elif request:
                 self._notify(_('%s ya está en marcha; para cambiar el formato pedilo con "Cambiar".') % request.name)
@@ -691,8 +691,10 @@ class AutoContentOperator(models.Model):
                                  order='id desc', limit=1)
         if request:
             if request.state == 'format':
-                # Mandó más material mientras le preguntábamos el formato: se suma y se vuelve a preguntar.
-                request.state = 'collecting'
+                # Llegó un archivo más mientras elige el formato (suele ser uno que WhatsApp entregó
+                # tarde): se suma a la misma solicitud y el formato que elija vale para todo.
+                self._notify(_('Sumé otro archivo a %(name)s (ahora son %(n)d). Elegí el formato en la lista '
+                               'de arriba.') % {'name': request.name, 'n': request.media_count + 1})
             return request
         brand = self.brand_id
         if not brand:

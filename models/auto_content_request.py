@@ -173,6 +173,9 @@ class AutoContentRequest(models.Model):
 
     def _bump(self):
         for request in self:
+            if request.state == 'format':
+                # Está eligiendo el formato: no se acorta la espera de la lista.
+                continue
             wait = request.operator_id.debounce_seconds or 90
             if 'video' in request.inbound_ids.mapped('kind'):
                 # Los videos tardan en subir: se espera más para juntar todos.
