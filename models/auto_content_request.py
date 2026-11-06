@@ -28,6 +28,7 @@ MAX_MEDIA_FOR_AI = 6
 MAX_IMAGES_MONTAGE = 12
 MAX_PHOTOS_MONTAGE = 4
 MAX_PHOTOS_SERIES = 6
+CATALOG_YES = {'este', 'esta', 'ese', 'esa', 'si', 'sí', 'dale', 'ok', 'me gusta', 'este me gusta', 'esta me gusta', 'listo', 'usá este', 'usa este'}
 VIDEO_DEBOUNCE = 120
 FORMAT_WAIT = timedelta(minutes=10)
 # Formatos que se ofrecen por WhatsApp: (código, título, descripción, instrucción para la IA).
@@ -109,6 +110,9 @@ class AutoContentRequest(models.Model):
     )
     pending_answer = fields.Text(string='Plan por armar', readonly=True, copy=False)
     pending_worker = fields.Char(string='Worker del plan', readonly=True, copy=False)
+    catalog_pending = fields.Boolean(string='Muestrario pedido', readonly=True, copy=False)
+    catalog_json = fields.Text(string='Muestrario enviado', readonly=True, copy=False,
+                               help='Cada pieza del muestrario con el mensaje de WhatsApp, para elegirla citándola.')
 
     @api.depends('inbound_ids.attachment_id')
     def _compute_media_count(self):
@@ -208,6 +212,18 @@ class AutoContentRequest(models.Model):
         stale = self.search([('state', '=', 'processing'), ('write_date', '<', now - STALE_PROCESSING)])
         stale.write({'state': 'queued'})
 
+        for request in self.search([('catalog_pending', '=', True)]):
+            request.catalog_pending = False
+            Cron._commit_progress()
+            try:
+                request._build_catalog()
+            except Exception as exc:  # noqa: BLE001 - se avisa y sigue la cola
+                _logger.exception('auto_content: falló el muestrario de %s.', request.name)
+                if request.operator_id:
+                    request.operator_id._notify(_('No pude armar el muestrario de %(name)s: %(error)s') % {
+                        'name': request.name, 'error': str(exc)[:300]})
+            Cron._commit_progress()
+
         for request in self.search([('state', '=', 'collecting'), ('process_after', '<=', now)]):
             request._close_collection()
         for request in self.search([('state', '=', 'format'), ('process_after', '<=', now)]):
@@ -246,6 +262,107 @@ class AutoContentRequest(models.Model):
             return
         self.state = 'brand'
         self._ask_brand()
+
+    # ------------------------------------------------------------------
+    # Muestrario: la misma pieza con todos los diseños, para elegir
+    # ------------------------------------------------------------------
+    def _ask_catalog(self):
+        self.ensure_one()
+        self.catalog_pending = True
+        self._trigger_cron()
+        if self.operator_id:
+            self.operator_id._notify(_('🎨 Armo el muestrario de %s con todos los diseños. Tarda 1 o 2 minutos.')
+                                     % self.name)
+
+    def _build_catalog(self):
+        self.ensure_one()
+        brand = self.brand_id
+        designs = brand._designs()
+        version = self.current_version_id
+        current = json.loads(version.plan_json) if version and version.plan_json else {}
+        workdir = Path(tempfile.mkdtemp(prefix='auto-content-muestrario-'))
+        try:
+            texts, media = self._write_media(workdir)
+            photos = [m['index'] for m in media if m['kind'] == 'image']
+            if not photos:
+                self.operator_id._notify(_('%s no tiene fotos para armar un muestrario.') % self.name)
+                return
+            main = current.get('media') if current.get('media') in photos else photos[0]
+            single = [c for c, s in designs.items() if s.get('media') == 'requerida' and c != 'cita']
+            multi = [c for c, s in designs.items() if s.get('media') == 'varias'] if len(photos) >= 2 else []
+            group = ([main] + [p for p in photos if p != main])[:3]
+            _texts, _media, images = self._prepare_media(workdir)
+            ai_media = self._ai_media(media)[:len(images)]
+            system_text, user_text = brand._prompts(texts, ai_media, None, None, self._extra_prompt(None))
+            user_text += planner.CATALOG_PROMPT.format(
+                disenos=', '.join(single + multi), foto=main, fotos=json.dumps(group),
+                actual=json.dumps({k: current.get(k) for k in ('diseno', 'datos', 'resumen')}, ensure_ascii=False))
+            names = []
+            for number, image in enumerate(images, 1):
+                name = 'imagen-%d.jpg' % number
+                (workdir / name).write_bytes(image)
+                names.append(name)
+            claude = claude_cli.find_claude(self._param('claude_path'))
+            prompt = claude_cli.build_prompt(system_text, user_text, names)
+            answer = claude_cli.run(claude, brand.claude_model or 'sonnet', prompt, workdir, self._claude_home())
+            raw = planner._extract_json(answer).get('piezas') or []
+            pieces = []
+            for item in raw:
+                if not isinstance(item, dict):
+                    continue
+                try:
+                    design, index, data = planner._parse_piece(
+                        item.get('diseno'), item.get('media'), item.get('datos'), designs, self._ai_media(media))
+                except planner.PlanError as exc:
+                    _logger.info('auto_content: muestrario, salteo una pieza: %s', exc)
+                    continue
+                if any(p['diseno'] == design for p in pieces):
+                    continue
+                pieces.append({'diseno': design, 'media': index, 'datos': data})
+            if not pieces:
+                raise UserError(_('La IA no devolvió piezas que sirvan.'))
+            sender = self.operator_id._sender()
+            sender.text(_('🎨 *Muestrario de %(name)s*: %(n)d estilos con el mismo material.\nPara usar uno, '
+                          '*citalo* y escribí "este" (o "este, pero…" con lo que quieras cambiar).') % {
+                'name': self.name, 'n': len(pieces)})
+            entries = []
+            for number, piece in enumerate(pieces, 1):
+                try:
+                    raw_png, _kind = self._render_piece(piece, media, workdir, 'muestra-%d' % number)
+                except Exception:  # noqa: BLE001 - una plantilla que falla no corta el muestrario
+                    _logger.exception('auto_content: muestrario, no pude renderizar %s.', piece['diseno'])
+                    continue
+                attachment = self.env['ir.attachment'].sudo().create({
+                    'name': '%s-%s-muestra-%s.png' % (brand.code, self.name.replace('/', ''), piece['diseno']),
+                    'raw': raw_png, 'mimetype': 'image/png', 'res_model': self._name, 'res_id': self.id,
+                })
+                color = (piece['datos'] or {}).get('color')
+                label = '%s · %d · %s%s' % (self.name, number, piece['diseno'], ' (%s)' % color if color else '')
+                uid = sender.media(attachment, 'image', caption=label) if len(raw_png) <= MAX_IMAGE_BYTES else None
+                entries.append(dict(piece, n=number, uid=uid or ''))
+            self.catalog_json = json.dumps(entries, ensure_ascii=False)
+        finally:
+            shutil.rmtree(workdir, ignore_errors=True)
+
+    def _choose_from_catalog(self, entry, text):
+        """Arma la versión con la pieza elegida del muestrario."""
+        self.ensure_one()
+        version = self.current_version_id
+        plan = json.loads(version.plan_json) if version and version.plan_json else {}
+        low = (text or '').lower().strip(' .!¡¿?')
+        label = '%s%s' % (entry['diseno'], ' (%s)' % entry['datos']['color'] if entry['datos'].get('color') else '')
+        if low in CATALOG_YES or not low:
+            plan.update({'diseno': entry['diseno'], 'media': entry['media'], 'datos': entry['datos'],
+                         'resumen': _('Elegida del muestrario: %s.') % label})
+            plan.pop('montaje', None)
+            self.write({'pending_answer': json.dumps(plan, ensure_ascii=False), 'pending_worker': 'muestrario',
+                        'pending_instruction': _('Elegida del muestrario: %s') % label, 'state': 'queued'})
+            self._trigger_cron()
+            if self.operator_id:
+                self.operator_id._notify(_('Dale, armo %(name)s con %(label)s.') % {'name': self.name, 'label': label})
+            return
+        self._request_change(_('Usá el diseño %(design)s del muestrario, con estos datos: %(data)s. Además: %(text)s') % {
+            'design': entry['diseno'], 'data': json.dumps(entry['datos'], ensure_ascii=False), 'text': text})
 
     @api.model
     def _content_formats(self):
@@ -346,7 +463,8 @@ class AutoContentRequest(models.Model):
             when = fields.Datetime.context_timestamp(self.with_context(tz=self.env.user.tz or 'America/Argentina/Buenos_Aires'), version.create_date).strftime('%d/%m %H:%M')
             lines.append('- %s · %s · %s · %s' % (when, version.request_id.name, labels.get(version.state, ''), designs))
         return ('## Últimas piezas de la marca (la más nueva primero)\n' + '\n'.join(lines)
-                + '\nNo repitas el diseño y color de la última; buscá variedad. En los videos, no repitas la '
+                + '\nNo repitas el diseño y color de la última, y que las del mismo día no se parezcan entre sí: '
+                  'rotá por todo el catálogo. En los videos, no repitas la '
                   'música de los últimos: elegí otra pista que vaya con el material.')
 
     def _keeps_media(self):
@@ -835,6 +953,7 @@ class AutoContentRequest(models.Model):
             return out.read_bytes(), 'video'
         if chosen:
             data['foto'] = chosen['path'].resolve().as_uri()
+            data['foto_ancho'], data['foto_alto'] = _image_size(chosen['path'])
         out = renderer.render_html(template, data, workdir / ('%s.png' % name), brand.width, brand.height, chrome)
         return out.read_bytes(), 'image'
 
@@ -1169,6 +1288,16 @@ class AutoContentVersion(models.Model):
             'url': '/web/content/%d?download=true' % self.output_attachment_id.id,
             'target': 'self',
         }
+
+
+def _image_size(path):
+    """Ancho y alto ya rotados (la plantilla ubica el "punto" sobre la foto)."""
+    from PIL import Image, ImageOps
+    try:
+        with Image.open(path) as image:
+            return ImageOps.exif_transpose(image).size
+    except Exception:  # noqa: BLE001 - sin tamaño, la plantilla supone la foto del tamaño de la caja
+        return None, None
 
 
 class AutoContentMessage(models.Model):

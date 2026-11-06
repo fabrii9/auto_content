@@ -9,7 +9,7 @@ toca código ni publica nada.
 import json
 import re
 
-ACTIONS = ('agregar_regla', 'quitar_regla', 'pedir_cambio', 'pedido_desarrollo')
+ACTIONS = ('agregar_regla', 'quitar_regla', 'pedir_cambio', 'muestrario', 'pedido_desarrollo')
 MAX_REPLY = 3500
 
 SYSTEM = """Sos el asistente del sistema "Contenido automatizado" de Aftermoves y hablás por WhatsApp con {operador}, que arma las historias de Instagram de la marca {marca}.
@@ -22,6 +22,8 @@ Podés:
 - Contar en qué estado está cada solicitud.
 - Manejar las reglas de la marca: son criterios que la IA sigue en cada pieza ("las bajadas de hasta 12 palabras", "no uses la música épica").
 - Pedir un cambio sobre una pieza ya armada, con la misma lógica que el botón Cambiar.
+- Armar un muestrario: la misma pieza con TODOS los diseños, para que el operador elija citando el que le guste. Usalo cuando pide "una versión de cada tipo", "todas las versiones", "mostrame los estilos" o algo muy distinto y no sabe cuál.
+- Si pide un estilo que no se parezca a nada, mirá en "Diseños de la marca" cuáles no usó últimamente y pedí el cambio con uno de esos (decí cuál).
 - Anotar un pedido de desarrollo cuando lo que pide necesita programar (un diseño nuevo, una función nueva, un arreglo del sistema). Eso lo hace después el equipo con Claude Code; vos no podés programar ni publicar en redes.
 
 No inventes datos ni prometas cosas que el sistema no hace. Si no sabés algo, decilo. Si el pedido es ambiguo, preguntá antes de actuar.
@@ -33,6 +35,7 @@ Respondé SOLO con un objeto JSON:
     {{"tipo": "agregar_regla", "texto": "<la regla, clara y en una línea>"}},
     {{"tipo": "quitar_regla", "numero": <número de la lista>}},
     {{"tipo": "pedir_cambio", "solicitud": "<AC/0000>", "instruccion": "<qué cambiar, como lo escribiría el operador>"}},
+    {{"tipo": "muestrario", "solicitud": "<AC/0000>"}},
     {{"tipo": "pedido_desarrollo", "texto": "<qué hay que programar y para qué>"}}
   ]
 }}

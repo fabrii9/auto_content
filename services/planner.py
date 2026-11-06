@@ -111,6 +111,19 @@ class PlanError(ValueError):
     """La respuesta de la IA no sirve."""
 
 
+CATALOG_PROMPT = """
+# Muestrario
+Esta vez NO armes una pieza: armá un MUESTRARIO con el mismo material para que el operador elija el estilo. Una pieza por cada uno de estos diseños: {disenos}.
+- En los de una foto usá la foto {foto}. En los de varias fotos usá {fotos}.
+- Mismo tema y mismo tono que la versión actual (abajo), pero aprovechá lo propio de cada diseño (el detalle señalado, la palabra gigante, las fichas, los chips...). Variá los colores entre piezas.
+- Completá todos los campos de cada diseño. No inventes datos.
+Respondé solo con JSON: {{"piezas": [{{"diseno": "<código>", "media": <número o lista>, "datos": {{...}}}}]}}
+
+Versión actual:
+{actual}
+"""
+
+
 def describe_designs(designs):
     lines = []
     for code, spec in designs.items():

@@ -169,6 +169,8 @@ class AutoContentOperator(models.Model):
             '  Le podés preguntar cómo va algo, por qué salió así una pieza, pedirle un cambio ("cambiale la música '
             'a AC/0026") o algo nuevo para el sistema (lo anota como pedido de desarrollo).\n\n'
             '*Reglas* (la IA las cumple en cada pieza)\n'
+            '*Muestrario*\n'
+            '• *#muestrario AC/0035*: la misma pieza con todos los diseños; citá el que te guste y escribí "este".\n\n'
             '• *#regla* y el texto: suma una. Ej.: #regla las bajadas de hasta 12 palabras\n'
             '• *#reglas*: la lista. *#quitar 2*: borra la regla 2.'
         ) % {
@@ -313,6 +315,12 @@ class AutoContentOperator(models.Model):
                 if waiting_change.current_version_id != version:
                     waiting_change.current_version_id = version
             if not version:
+                catalog = Request.search([('operator_id', '=', self.id), ('catalog_json', 'ilike', quoted_uid)], limit=1)
+                entry = next((e for e in json.loads(catalog.catalog_json or '[]') if e.get('uid') == quoted_uid), None)
+                if entry:
+                    catalog._add_inbound(msg_uid, 'text', body=body, counts_as_material=False)
+                    catalog._choose_from_catalog(entry, body)
+                    return
                 quoted_change = self._quoted_material(quoted_uid, body)
                 if quoted_change is not None:
                     waiting_change, body = quoted_change
@@ -398,7 +406,7 @@ class AutoContentOperator(models.Model):
         low = body.lower().strip()
         word, rest = (low.split(None, 1) + [''])[:2]
         text = body.strip()[len(word):].strip()
-        if word not in ('#regla', '#reglas', '#quitar', '#claude', '#chat', '#fin', '#salir'):
+        if word not in ('#regla', '#reglas', '#quitar', '#claude', '#chat', '#fin', '#salir', '#muestrario'):
             return False
         self.env['auto.content.message'].sudo().create(
             {'msg_uid': msg_uid, 'operator_id': self.id, 'kind': 'text', 'body': body, 'is_material': False})
@@ -406,7 +414,18 @@ class AutoContentOperator(models.Model):
         if word in ('#regla', '#reglas', '#quitar') and not brand:
             self._notify(_('Primero elegí la marca (#ayuda te dice cómo).'))
             return True
-        if word == '#regla':
+        if word == '#muestrario':
+            name = re.search(r'ac/?\s*0*(\d+)', rest)
+            Request = self.env['auto.content.request'].sudo()
+            domain = [('operator_id', '=', self.id), ('current_version_id', '!=', False)]
+            if name:
+                domain.append(('name', '=', 'AC/%04d' % int(name.group(1))))
+            request = Request.search(domain, order='id desc', limit=1)
+            if request:
+                request._ask_catalog()
+            else:
+                self._notify(_('No encontré esa solicitud. Ej.: #muestrario AC/0035'))
+        elif word == '#regla':
             if not text:
                 self._notify(_('Escribí la regla después de #regla. Ej.: #regla las bajadas de hasta 12 palabras'))
             else:
@@ -423,6 +442,8 @@ class AutoContentOperator(models.Model):
             if not text:
                 self._notify(_('Escribí la pregunta después de #claude, o usá #chat para conversar.'))
             else:
+                # Abre la charla: si Claude repregunta, el "sí" va para él (y no aprueba una pieza).
+                self.write({'chat_until': fields.Datetime.now() + CHAT_IDLE})
                 self._queue_chat(text)
         elif word == '#chat':
             self.write({'chat_until': fields.Datetime.now() + CHAT_IDLE})
@@ -542,6 +563,8 @@ class AutoContentOperator(models.Model):
         finally:
             shutil.rmtree(workdir, ignore_errors=True)
         reply, actions = assistant.parse_answer(answer)
+        if not history:
+            reply += _('\n\n_Seguimos charlando: respondé acá. *#fin* para cerrar._')
         done = [self._run_chat_action(action) for action in actions]
         done = [d for d in done if d]
         if done:
@@ -578,6 +601,15 @@ class AutoContentOperator(models.Model):
                                  body=instruction, counts_as_material=False)
             request._request_change(instruction)
             return _('🔁 Pedí el cambio en %(name)s: "%(text)s"') % {'name': name, 'text': instruction}
+        if kind == 'muestrario':
+            name = (action.get('solicitud') or '').strip().upper()
+            request = self.env['auto.content.request'].sudo().search(
+                [('name', '=', name), ('operator_id', '=', self.id), ('current_version_id', '!=', False)], limit=1)
+            if not request:
+                return _('⚠️ No encontré %s para el muestrario.') % (name or '?')
+            request.catalog_pending = True
+            request._trigger_cron()
+            return _('🎨 Armo el muestrario de %s; te llega en 1 o 2 minutos.') % name
         if kind == 'pedido_desarrollo' and (action.get('texto') or '').strip():
             target = self.brand_id.sudo() if self.brand_id else None
             body = _('Pedido de desarrollo por WhatsApp (%(op)s): %(text)s') % {

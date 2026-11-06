@@ -3,6 +3,7 @@
 import logging
 
 from odoo import models
+from odoo.service.model import PG_CONCURRENCY_EXCEPTIONS_TO_RETRY
 
 _logger = logging.getLogger(__name__)
 
@@ -16,7 +17,9 @@ class WhatsappAccount(models.Model):
         Antes del flujo nativo se apaga el agente de ventas en su chat, para
         que no les conteste. Después, con el mensaje y sus archivos ya
         guardados por Odoo, se procesan como material o como respuesta.
-        Un error acá nunca corta el webhook de WhatsApp.
+        Un error acá nunca corta el webhook de WhatsApp, salvo los choques de
+        concurrencia de la base: esos se dejan pasar para que Odoo reintente
+        el webhook entero (si no, se pierden fotos cuando llegan varias juntas).
         """
         data = value
         if 'messages' not in data and data.get('whatsapp_business_api_data', {}).get('messages'):
@@ -30,6 +33,8 @@ class WhatsappAccount(models.Model):
                 try:
                     if Consultas._claim(self, item):
                         continue
+                except PG_CONCURRENCY_EXCEPTIONS_TO_RETRY:
+                    raise
                 except Exception:
                     _logger.exception('auto_content: no pude consultar el ruteo de Consultas por WhatsApp.')
             operator = Operator._match(self, item.get('from'))
@@ -38,6 +43,8 @@ class WhatsappAccount(models.Model):
         if pending:
             try:
                 Operator.browse(list({op.id for op, _item in pending}))._mute_sales_agent()
+            except PG_CONCURRENCY_EXCEPTIONS_TO_RETRY:
+                raise
             except Exception:
                 _logger.exception('auto_content: no pude apagar el agente de ventas.')
 
@@ -47,6 +54,8 @@ class WhatsappAccount(models.Model):
             try:
                 with self.env.cr.savepoint():
                     operator._handle_inbound(self, item)
+            except PG_CONCURRENCY_EXCEPTIONS_TO_RETRY:
+                raise
             except Exception:
                 _logger.exception('auto_content: error procesando el mensaje %s.', item.get('id'))
         return result
